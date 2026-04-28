@@ -9,16 +9,16 @@ import Select from "@mui/material/Select";
 import MenuItem from "@mui/material/MenuItem";
 import Slider from "@mui/material/Slider";
 import CircularProgress from "@mui/material/CircularProgress";
-import { useTheme, type ThemeColors } from "../theme";
-import { COLORMAPS, COLORMAP_NAMES, renderToOffscreenReuse } from "../colormaps";
+import { useTheme } from "../theme";
+import { COLORMAPS, renderToOffscreenReuse } from "../colormaps";
+
+const CMAP_OPTIONS = ["gray", "inferno", "viridis", "magma"] as const;
 import {
   findDataRange,
-  sliderRange,
   percentileClip,
   applyLogScale,
 } from "../stats";
 import { extractFloat32, formatNumber } from "../format";
-import { computeHistogramFromBytes } from "../histogram";
 import { roundToNiceValue } from "../scalebar";
 
 // ============================================================================
@@ -36,12 +36,13 @@ const TRACE_COLORS = {
   bg: "#ef5350",
   fk: "#66bb6a",
   gr: "#4fc3f7",
+  pdf: "#ba68c8",
 };
 
 const MARGIN_TOP = 12;
 const MARGIN_RIGHT = 16;
-const MARGIN_BOTTOM = 46;
-const MARGIN_LEFT_MIN = 56;
+const MARGIN_BOTTOM = 56;
+const MARGIN_LEFT_MIN = 72;
 const AXIS_TICK_PX = 4;
 const TICK_LABEL_W = 50;
 
@@ -94,41 +95,6 @@ function fillCircleMask(
 }
 
 // ============================================================================
-// Histogram mini-component
-// ============================================================================
-function HistogramBar({ data, vminPct, vmaxPct, onRangeChange, colors }: {
-  data: Float32Array | null; vminPct: number; vmaxPct: number;
-  onRangeChange: (min: number, max: number) => void; colors: ThemeColors;
-}) {
-  const canvasRef = React.useRef<HTMLCanvasElement>(null);
-  const bins = React.useMemo(() => data ? computeHistogramFromBytes(data, 64) : null, [data]);
-  React.useEffect(() => {
-    const cvs = canvasRef.current;
-    if (!cvs || !bins) return;
-    const ctx = cvs.getContext("2d");
-    if (!ctx) return;
-    const w = cvs.width, h = cvs.height;
-    ctx.clearRect(0, 0, w, h);
-    const maxBin = Math.max(...bins, 1);
-    const barW = w / bins.length;
-    for (let i = 0; i < bins.length; i++) {
-      const pct = (i / bins.length) * 100;
-      ctx.fillStyle = pct >= vminPct && pct <= vmaxPct ? colors.accent : colors.border;
-      const barH = (bins[i] / maxBin) * h;
-      ctx.fillRect(i * barW, h - barH, barW - 0.5, barH);
-    }
-  }, [bins, vminPct, vmaxPct, colors]);
-  return (
-    <Box>
-      <canvas ref={canvasRef} width={120} height={32} style={{ width: 120, height: 32, display: "block" }} />
-      <Slider value={[vminPct, vmaxPct]} onChange={(_, v) => { const val = v as number[]; onRangeChange(val[0], val[1]); }}
-        min={0} max={100} size="small"
-        sx={{ width: 120, mt: 0.5, "& .MuiSlider-thumb": { width: 10, height: 10 } }} />
-    </Box>
-  );
-}
-
-// ============================================================================
 // Main component
 // ============================================================================
 function ShowPDF4DWidget() {
@@ -153,6 +119,8 @@ function ShowPDF4DWidget() {
   const [fkYBytes] = useModelState<DataView>("fk_y_bytes");
   const [grXBytes] = useModelState<DataView>("gr_x_bytes");
   const [grYBytes] = useModelState<DataView>("gr_y_bytes");
+  const [pdfXBytes] = useModelState<DataView>("pdf_x_bytes");
+  const [pdfYBytes] = useModelState<DataView>("pdf_y_bytes");
   const [kMinFit, setKMinFit] = useModelState<number>("k_min_fit");
   const [kMaxFit, setKMaxFit] = useModelState<number>("k_max_fit");
   const [kMinWindow, setKMinWindow] = useModelState<number>("k_min_window");
@@ -162,12 +130,14 @@ function ShowPDF4DWidget() {
   const [kHighpass, setKHighpass] = useModelState<number>("k_highpass");
   const [dampOrigin, setDampOrigin] = useModelState<boolean>("damp_origin_oscillations");
   const [rCut, setRCut] = useModelState<number>("r_cut");
+  const [densityMode, setDensityMode] = useModelState<string>("density_mode");
+  const [densityValue, setDensityValue] = useModelState<number>("density_value");
   const [kMinAvail] = useModelState<number>("k_min_available");
   const [kMaxAvail] = useModelState<number>("k_max_available");
   const [plotMode, setPlotMode] = useModelState<string>("plot_mode");
   const [showBackground, setShowBackground] = useModelState<boolean>("show_background");
   const [cmap, setCmap] = useModelState<string>("cmap");
-  const [logScale, setLogScale] = useModelState<boolean>("log_scale");
+  const [logScale] = useModelState<boolean>("log_scale");
   const [autoContrast] = useModelState<boolean>("auto_contrast");
   const [showStats] = useModelState<boolean>("show_stats");
   const [showControls] = useModelState<boolean>("show_controls");
@@ -175,15 +145,13 @@ function ShowPDF4DWidget() {
   const [statusMessage] = useModelState<string>("status_message");
 
   // --- Local state ---
-  const NAV_SIZE = 300;
-  const PLOT_W = 500;
-  const PLOT_H = 320;
+  const PLOT_H = 360;
+  const NAV_SIZE = PLOT_H;
+  const PLOT_W = 520;
   const navH = Math.round(NAV_SIZE * (scanRows / Math.max(scanCols, 1)));
   const [navZoom, setNavZoom] = React.useState(1);
   const [navPanX, setNavPanX] = React.useState(0);
   const [navPanY, setNavPanY] = React.useState(0);
-  const [navVminPct, setNavVminPct] = React.useState(0);
-  const [navVmaxPct, setNavVmaxPct] = React.useState(100);
   const [maskAction, setMaskAction] = React.useState<"add" | "subtract">("add");
   const [maskRenderVersion, setMaskRenderVersion] = React.useState(0);
   const [shapePreview, setShapePreview] = React.useState<{ r0: number; c0: number; r1: number; c1: number } | null>(null);
@@ -199,6 +167,7 @@ function ShowPDF4DWidget() {
   const [localKLowpass, setLocalKLowpass] = React.useState(kLowpass);
   const [localKHighpass, setLocalKHighpass] = React.useState(kHighpass);
   const [localRCut, setLocalRCut] = React.useState(rCut);
+  const [localDensity, setLocalDensity] = React.useState<string>(String(densityValue));
   const [dataVersion, setDataVersion] = React.useState(0);
 
   React.useEffect(() => { setLocalKFit([kMinFit, kMaxFit]); }, [kMinFit, kMaxFit]);
@@ -207,6 +176,7 @@ function ShowPDF4DWidget() {
   React.useEffect(() => { setLocalKLowpass(kLowpass); }, [kLowpass]);
   React.useEffect(() => { setLocalKHighpass(kHighpass); }, [kHighpass]);
   React.useEffect(() => { setLocalRCut(rCut); }, [rCut]);
+  React.useEffect(() => { setLocalDensity(densityValue.toPrecision(4)); }, [densityValue]);
 
   const userZoomedRef = React.useRef(false);
 
@@ -225,6 +195,8 @@ function ShowPDF4DWidget() {
   const fkYRef = React.useRef<Float32Array | null>(null);
   const grXRef = React.useRef<Float32Array | null>(null);
   const grYRef = React.useRef<Float32Array | null>(null);
+  const pdfXRef = React.useRef<Float32Array | null>(null);
+  const pdfYRef = React.useRef<Float32Array | null>(null);
   const isPanningRef = React.useRef(false);
   const panStartRef = React.useRef<{ x: number; y: number; px: number; py: number } | null>(null);
   const isPaintingRef = React.useRef(false);
@@ -276,16 +248,17 @@ function ShowPDF4DWidget() {
     if (!raw || !oc || !imgData) return;
     const lut = COLORMAPS[cmap] || COLORMAPS.inferno;
     const processed = logScale ? applyLogScale(raw) : raw;
-    const range = findDataRange(processed);
     let vmin: number, vmax: number;
     if (autoContrast) {
       ({ vmin, vmax } = percentileClip(processed, 2, 98));
     } else {
-      ({ vmin, vmax } = sliderRange(range.min, range.max, navVminPct, navVmaxPct));
+      const range = findDataRange(processed);
+      vmin = range.min;
+      vmax = range.max;
     }
     renderToOffscreenReuse(processed, lut, vmin, vmax, oc, imgData);
     setDataVersion((v) => v + 1);
-  }, [cmap, logScale, autoContrast, navVminPct, navVmaxPct, dataVersion]);
+  }, [cmap, logScale, autoContrast, dataVersion]);
 
   // =========================================================================
   // Effect 3: Draw nav canvas (cheap)
@@ -383,8 +356,10 @@ function ShowPDF4DWidget() {
     fkYRef.current = fkYBytes ? extractFloat32(fkYBytes) : null;
     grXRef.current = grXBytes ? extractFloat32(grXBytes) : null;
     grYRef.current = grYBytes ? extractFloat32(grYBytes) : null;
+    pdfXRef.current = pdfXBytes ? extractFloat32(pdfXBytes) : null;
+    pdfYRef.current = pdfYBytes ? extractFloat32(pdfYBytes) : null;
     if (!userZoomedRef.current) autoFitPlot();
-  }, [ikXBytes, ikYBytes, ikBgYBytes, fkXBytes, fkYBytes, grXBytes, grYBytes]);
+  }, [ikXBytes, ikYBytes, ikBgYBytes, fkXBytes, fkYBytes, grXBytes, grYBytes, pdfXBytes, pdfYBytes]);
 
   React.useEffect(() => { userZoomedRef.current = false; autoFitPlot(); }, [plotMode]);
 
@@ -393,6 +368,7 @@ function ShowPDF4DWidget() {
     let yArr: Float32Array | null = null;
     if (plotMode === "Ik") { xArr = ikXRef.current; yArr = ikYRef.current; }
     else if (plotMode === "Fk") { xArr = fkXRef.current; yArr = fkYRef.current; }
+    else if (plotMode === "gr") { xArr = pdfXRef.current; yArr = pdfYRef.current; }
     else { xArr = grXRef.current; yArr = grYRef.current; }
     if (!xArr || !yArr || xArr.length === 0) return;
     const xR = findDataRange(xArr);
@@ -462,17 +438,19 @@ function ShowPDF4DWidget() {
     ctx.beginPath(); ctx.moveTo(snap(mL), mT); ctx.lineTo(snap(mL), snap(mT + ph)); ctx.lineTo(mL + pw, snap(mT + ph)); ctx.stroke();
     // X ticks
     ctx.fillStyle = isDark ? "#aaa" : "#555";
-    ctx.font = `11px ${FONT}`;
+    ctx.font = `13px ${FONT}`;
     ctx.textAlign = "center"; ctx.textBaseline = "top";
     for (const tv of xTicks) { const cx = snap(d2cx(tv)); ctx.beginPath(); ctx.moveTo(cx, mT + ph); ctx.lineTo(cx, mT + ph + AXIS_TICK_PX); ctx.stroke(); ctx.fillText(formatNumber(tv), cx, mT + ph + AXIS_TICK_PX + 2); }
     // Y ticks
     ctx.textAlign = "right"; ctx.textBaseline = "middle";
     for (const tv of yTicks) { const cy = snap(d2cy(tv)); ctx.beginPath(); ctx.moveTo(mL, cy); ctx.lineTo(mL - AXIS_TICK_PX, cy); ctx.stroke(); ctx.fillText(useLogY ? formatNumber(Math.pow(10, tv)) : formatNumber(tv), mL - AXIS_TICK_PX - 2, cy); }
     // Axis labels
-    ctx.font = `12px ${FONT}`; ctx.fillStyle = isDark ? "#ccc" : "#333"; ctx.textAlign = "center"; ctx.textBaseline = "top";
-    ctx.fillText(plotMode === "Gr" ? "r (Å)" : "k (Å⁻¹)", mL + pw / 2, mT + ph + AXIS_TICK_PX + 16);
+    ctx.font = `14px ${FONT}`; ctx.fillStyle = isDark ? "#ccc" : "#333"; ctx.textAlign = "center"; ctx.textBaseline = "top";
+    const xAxisLabel = (plotMode === "Gr" || plotMode === "gr") ? "r (Å)" : "k (Å⁻¹)";
+    ctx.fillText(xAxisLabel, mL + pw / 2, mT + ph + AXIS_TICK_PX + 26);
     ctx.save(); ctx.translate(14, mT + ph / 2); ctx.rotate(-Math.PI / 2); ctx.textAlign = "center"; ctx.textBaseline = "top";
-    ctx.fillText(plotMode === "Ik" ? "I(k)" : plotMode === "Fk" ? "F(k)" : "G(r)", 0, 0); ctx.restore();
+    const yAxisLabel = plotMode === "Ik" ? "I(k)" : plotMode === "Fk" ? "F(k)" : plotMode === "gr" ? "g(r)" : "G(r)";
+    ctx.fillText(yAxisLabel, 0, 0); ctx.restore();
     // Clip
     ctx.save(); ctx.beginPath(); ctx.rect(mL, mT, pw, ph); ctx.clip();
     // Draw traces
@@ -495,6 +473,11 @@ function ShowPDF4DWidget() {
       if (showBackground) drawLine(ikXRef.current, ikBgRef.current, TRACE_COLORS.bg, true);
     } else if (plotMode === "Fk") {
       drawLine(fkXRef.current, fkYRef.current, TRACE_COLORS.fk);
+    } else if (plotMode === "gr") {
+      ctx.strokeStyle = isDark ? "rgba(255,255,255,0.2)" : "rgba(0,0,0,0.2)";
+      ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+      const oneY = d2cy(1); ctx.beginPath(); ctx.moveTo(mL, oneY); ctx.lineTo(mL + pw, oneY); ctx.stroke(); ctx.setLineDash([]);
+      drawLine(pdfXRef.current, pdfYRef.current, TRACE_COLORS.pdf);
     } else {
       ctx.strokeStyle = isDark ? "rgba(255,255,255,0.2)" : "rgba(0,0,0,0.2)";
       ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
@@ -513,15 +496,15 @@ function ShowPDF4DWidget() {
         ctx.setLineDash([]);
         const displayY = useLogY ? Math.pow(10, cursorData.y) : cursorData.y;
         const label = `${formatNumber(cursorData.x)}, ${formatNumber(displayY)}`;
-        ctx.font = `10px ${MONO}`;
+        ctx.font = `12px ${MONO}`;
         const tw = ctx.measureText(label).width + 8;
         let bx = cx + 10; if (bx + tw > mL + pw) bx = cx - tw - 10;
-        let by = cy - 20; if (by < mT) by = cy + 10;
+        let by = cy - 22; if (by < mT) by = cy + 10;
         ctx.fillStyle = isDark ? "rgba(30,30,30,0.9)" : "rgba(255,255,255,0.9)";
-        ctx.fillRect(bx, by, tw, 16);
-        ctx.strokeStyle = isDark ? "#555" : "#ccc"; ctx.lineWidth = 1; ctx.strokeRect(bx, by, tw, 16);
+        ctx.fillRect(bx, by, tw, 18);
+        ctx.strokeStyle = isDark ? "#555" : "#ccc"; ctx.lineWidth = 1; ctx.strokeRect(bx, by, tw, 18);
         ctx.fillStyle = isDark ? "#eee" : "#333"; ctx.textAlign = "left"; ctx.textBaseline = "middle";
-        ctx.fillText(label, bx + 4, by + 8);
+        ctx.fillText(label, bx + 4, by + 9);
       }
     }
     if (computing) {
@@ -569,10 +552,13 @@ function ShowPDF4DWidget() {
       return;
     }
     const { row, col } = screenToImage(e);
-    const value = maskAction === "add" ? 1 : 0;
+    // "+" adds to the mask (excludes the area from analysis = 0);
+    // "-" removes from the mask (re-includes the area = 1).
+    const value = maskAction === "add" ? 0 : 1;
     if (maskTool === "freeform") {
       isPaintingRef.current = true;
-      fillCircleMask(maskRef.current, scanCols, scanRows, row, col, maskBrushSize, value);
+      const half = maskBrushSize - 1;
+      fillRectMask(maskRef.current, scanCols, scanRows, row - half, col - half, row + half, col + half, value);
       setMaskRenderVersion((v) => v + 1);
     } else {
       isDraggingShapeRef.current = true;
@@ -589,7 +575,8 @@ function ShowPDF4DWidget() {
     }
     const { row, col } = screenToImage(e);
     if (isPaintingRef.current && maskRef.current) {
-      fillCircleMask(maskRef.current, scanCols, scanRows, row, col, maskBrushSize, maskAction === "add" ? 1 : 0);
+      const half = maskBrushSize - 1;
+      fillRectMask(maskRef.current, scanCols, scanRows, row - half, col - half, row + half, col + half, maskAction === "add" ? 0 : 1);
       setMaskRenderVersion((v) => v + 1);
     }
     if (isDraggingShapeRef.current && shapeStartRef.current)
@@ -600,7 +587,7 @@ function ShowPDF4DWidget() {
     if (isPanningRef.current) { isPanningRef.current = false; panStartRef.current = null; return; }
     if (isPaintingRef.current) { isPaintingRef.current = false; syncMaskToPython(); return; }
     if (isDraggingShapeRef.current && shapeStartRef.current && maskRef.current && shapePreview) {
-      const value = maskAction === "add" ? 1 : 0;
+      const value = maskAction === "add" ? 0 : 1;
       const { r0, c0, r1, c1 } = shapePreview;
       if (maskTool === "circle") {
         fillCircleMask(maskRef.current, scanCols, scanRows, (r0 + r1) / 2, (c0 + c1) / 2, Math.max(Math.abs(c1 - c0), Math.abs(r1 - r0)) / 2, value);
@@ -711,13 +698,13 @@ function ShowPDF4DWidget() {
   // Styles
   // =========================================================================
   const typo = {
-    title: { fontSize: 13, fontWeight: 600, color: colors.accent, fontFamily: FONT },
-    label: { fontSize: 11, color: colors.text, fontFamily: FONT },
-    labelSmall: { fontSize: 10, color: colors.textMuted, fontFamily: FONT },
-    value: { fontSize: 10, fontFamily: MONO, color: colors.text },
+    title: { fontSize: 15, fontWeight: 600, color: colors.accent, fontFamily: FONT },
+    label: { fontSize: 13, color: colors.text, fontFamily: FONT },
+    labelSmall: { fontSize: 12, fontWeight: 600, color: colors.textMuted, fontFamily: FONT },
+    value: { fontSize: 12, fontFamily: MONO, color: colors.text },
   };
   const switchSmall = { "& .MuiSwitch-thumb": { width: 12, height: 12 }, "& .MuiSwitch-switchBase": { padding: "4px" } };
-  const compactBtn = { fontSize: 10, minWidth: 36, px: 1, py: 0.25, textTransform: "none" as const };
+  const compactBtn = { fontSize: 12, minWidth: 36, px: 1, py: 0.25, textTransform: "none" as const };
   const imageBox = { position: "relative" as const, border: `1px solid ${colors.border}`, overflow: "hidden", bgcolor: isDark ? "#111" : "#eee" };
 
   // =========================================================================
@@ -736,8 +723,8 @@ function ShowPDF4DWidget() {
       <Stack direction="row" spacing={`${SPACING.LG}px`}>
         {/* LEFT: Nav + Mask */}
         <Box sx={{ width: NAV_SIZE }}>
-          <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 28, flexWrap: "wrap" }}>
-            <Typography sx={typo.label}>Scan ({scanRows}×{scanCols})</Typography>
+          <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, minHeight: 32, flexWrap: "wrap", rowGap: `${SPACING.XS}px` }}>
+            <span style={{ fontSize: 12, fontFamily: FONT, color: colors.textMuted }}>Scan ({scanRows}×{scanCols})</span>
             <Stack direction="row" spacing={`2px`} alignItems="center">
               {(["rectangle", "circle", "freeform"] as const).map((tool) => (
                 <Button key={tool} size="small" variant={maskTool === tool ? "contained" : "outlined"}
@@ -750,11 +737,11 @@ function ShowPDF4DWidget() {
                 onClick={() => setMaskAction((a) => {
                   if (!maskRef.current) return a === "add" ? "subtract" : "add";
                   if (a === "add") {
-                    // Switching to subtract: start with everything included
-                    maskRef.current.fill(1);
-                  } else {
-                    // Switching to add: start with nothing included
+                    // Switching to subtract: drawing now re-includes — start with everything excluded
                     maskRef.current.fill(0);
+                  } else {
+                    // Switching to add: drawing now excludes — start with everything included
+                    maskRef.current.fill(1);
                   }
                   setMaskRenderVersion((v) => v + 1);
                   syncMaskToPython();
@@ -762,8 +749,8 @@ function ShowPDF4DWidget() {
                 })}>
                 {maskAction === "add" ? "+" : "−"}
               </Button>
-              <Button size="small" sx={compactBtn} onClick={() => { if (maskRef.current) { maskRef.current.fill(1); setMaskRenderVersion((v) => v + 1); syncMaskToPython(); } }}>Clr</Button>
-              <Button size="small" sx={compactBtn} onClick={() => { if (maskRef.current) { for (let i = 0; i < maskRef.current.length; i++) maskRef.current[i] = maskRef.current[i] ? 0 : 1; setMaskRenderVersion((v) => v + 1); syncMaskToPython(); } }}>Inv</Button>
+              <Button size="small" sx={compactBtn} onClick={() => { if (maskRef.current) { maskRef.current.fill(1); setMaskRenderVersion((v) => v + 1); syncMaskToPython(); } }}>Clear</Button>
+              <Button size="small" sx={compactBtn} onClick={() => { if (maskRef.current) { for (let i = 0; i < maskRef.current.length; i++) maskRef.current[i] = maskRef.current[i] ? 0 : 1; setMaskRenderVersion((v) => v + 1); syncMaskToPython(); } }}>Invert</Button>
             </Stack>
           </Stack>
           <Box sx={imageBox} style={{ width: NAV_SIZE, height: navH }}>
@@ -774,7 +761,7 @@ function ShowPDF4DWidget() {
               onMouseLeave={() => { isPaintingRef.current = false; isDraggingShapeRef.current = false; setShapePreview(null); }}
               onWheel={handleNavWheel} />
           </Box>
-          {showStats && <Typography sx={{ ...typo.value, mt: `${SPACING.XS}px` }}>{maskPixelCount} / {scanRows * scanCols} included ({(maskFraction * 100).toFixed(1)}%)</Typography>}
+          {showStats && <div style={{ fontSize: 12, fontFamily: MONO, color: colors.textMuted, marginTop: SPACING.XS }}>{maskPixelCount} / {scanRows * scanCols} included ({(maskFraction * 100).toFixed(1)}%)</div>}
           {showControls && (
             <Box sx={{ mt: `${SPACING.SM}px` }}>
               {maskTool === "freeform" && (
@@ -785,25 +772,21 @@ function ShowPDF4DWidget() {
                   <Typography sx={typo.value}>{maskBrushSize}</Typography>
                 </Stack>
               )}
-              <Stack direction="row" alignItems="center" gap={1} sx={{ mb: `${SPACING.XS}px` }}>
+              <Stack direction="row" alignItems="center" gap={1}>
                 <Typography sx={typo.labelSmall}>Cmap:</Typography>
-                <Select value={cmap} onChange={(e) => setCmap(e.target.value)} size="small" sx={{ fontSize: 10, height: 24, minWidth: 80 }}>
-                  {COLORMAP_NAMES.map((name) => <MenuItem key={name} value={name} sx={{ fontSize: 10 }}>{name}</MenuItem>)}
+                <Select value={cmap} onChange={(e) => setCmap(e.target.value)} size="small" sx={{ fontSize: 12, height: 28, minWidth: 80 }}>
+                  {CMAP_OPTIONS.map((name) => <MenuItem key={name} value={name} sx={{ fontSize: 12 }}>{name}</MenuItem>)}
                 </Select>
-                <Typography sx={typo.labelSmall}>Log:</Typography>
-                <Switch checked={logScale} onChange={(e) => setLogScale(e.target.checked)} size="small" sx={switchSmall} />
               </Stack>
-              <HistogramBar data={rawNavRef.current} vminPct={navVminPct} vmaxPct={navVmaxPct}
-                onRangeChange={(min, max) => { setNavVminPct(min); setNavVmaxPct(max); }} colors={colors} />
             </Box>
           )}
         </Box>
 
         {/* RIGHT: Curves */}
-        <Box sx={{ flex: 1, minWidth: 300 }}>
-          <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 28 }}>
+        <Box sx={{ width: PLOT_W, flexShrink: 0 }}>
+          <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, minHeight: 32, flexWrap: "wrap", rowGap: `${SPACING.XS}px` }}>
             <Stack direction="row" spacing={`${SPACING.XS}px`}>
-              {([["Ik", "I(k)"], ["Fk", "F(k)"], ["Gr", "G(r)"]] as const).map(([mode, label]) => (
+              {([["Ik", "I(k)"], ["Fk", "F(k)"], ["Gr", "G(r)"], ["gr", "g(r)"]] as const).map(([mode, label]) => (
                 <Button key={mode} size="small" variant={plotMode === mode ? "contained" : "outlined"} sx={compactBtn}
                   onClick={() => setPlotMode(mode)}>{label}</Button>
               ))}
@@ -823,7 +806,7 @@ function ShowPDF4DWidget() {
               onDoubleClick={() => { userZoomedRef.current = false; autoFitPlot(); }} onWheel={handlePlotWheel} />
           </Box>
           {showStats && cursorData && <Typography sx={{ ...typo.value, mt: `${SPACING.XS}px` }}>
-            {plotMode === "Gr" ? "r" : "k"} = {formatNumber(cursorData.x, 4)}, {plotMode === "Ik" ? "I" : plotMode === "Fk" ? "F" : "G"} = {formatNumber(plotMode === "Ik" && ikLogScale ? Math.pow(10, cursorData.y) : cursorData.y, 4)}
+            {(plotMode === "Gr" || plotMode === "gr") ? "r" : "k"} = {formatNumber(cursorData.x, 4)}, {plotMode === "Ik" ? "I" : plotMode === "Fk" ? "F" : plotMode === "gr" ? "g" : "G"} = {formatNumber(plotMode === "Ik" && ikLogScale ? Math.pow(10, cursorData.y) : cursorData.y, 4)}
           </Typography>}
           {showControls && (
             <Box sx={{ mt: `${SPACING.SM}px`, display: "flex", flexDirection: "column", gap: `${SPACING.XS}px` }}>
@@ -833,7 +816,7 @@ function ShowPDF4DWidget() {
                   onChangeCommitted={(_, v) => { const val = v as [number, number]; setKMinFit(val[0]); setKMaxFit(val[1]); }}
                   min={kMinAvail} max={kMaxAvail} step={0.01} size="small"
                   sx={{ flex: 1, "& .MuiSlider-thumb": { width: 10, height: 10 } }} />
-                <Typography sx={{ ...typo.value, minWidth: 90 }}>[{localKFit[0].toFixed(2)}, {localKFit[1].toFixed(2)}]</Typography>
+                <Typography sx={{ ...typo.value, color: colors.textMuted, minWidth: 90 }}>[{localKFit[0].toFixed(2)}, {localKFit[1].toFixed(2)}]</Typography>
               </Stack>
               <Stack direction="row" alignItems="center" gap={1}>
                 <Typography sx={{ ...typo.labelSmall, minWidth: 55 }}>k window:</Typography>
@@ -841,28 +824,28 @@ function ShowPDF4DWidget() {
                   onChangeCommitted={(_, v) => { const val = v as [number, number]; setKMinWindow(val[0]); setKMaxWindow(val[1]); }}
                   min={kMinAvail} max={kMaxAvail} step={0.01} size="small"
                   sx={{ flex: 1, "& .MuiSlider-thumb": { width: 10, height: 10 } }} />
-                <Typography sx={{ ...typo.value, minWidth: 90 }}>[{localKWin[0].toFixed(2)}, {localKWin[1].toFixed(2)}]</Typography>
+                <Typography sx={{ ...typo.value, color: colors.textMuted, minWidth: 90 }}>[{localKWin[0].toFixed(2)}, {localKWin[1].toFixed(2)}]</Typography>
               </Stack>
               <Stack direction="row" alignItems="center" gap={1}>
                 <Typography sx={{ ...typo.labelSmall, minWidth: 55 }}>r max:</Typography>
                 <Slider value={localRMax} onChange={(_, v) => setLocalRMax(v as number)}
                   onChangeCommitted={(_, v) => setRMax(v as number)} min={1} max={50} step={0.5} size="small"
                   sx={{ flex: 1, "& .MuiSlider-thumb": { width: 10, height: 10 } }} />
-                <Typography sx={{ ...typo.value, minWidth: 50 }}>{localRMax.toFixed(1)} Å</Typography>
+                <Typography sx={{ ...typo.value, color: colors.textMuted, minWidth: 50 }}>{localRMax.toFixed(1)} Å</Typography>
               </Stack>
               <Stack direction="row" alignItems="center" gap={1}>
                 <Typography sx={{ ...typo.labelSmall, minWidth: 55 }}>k lowpass:</Typography>
                 <Slider value={localKLowpass} onChange={(_, v) => setLocalKLowpass(v as number)}
                   onChangeCommitted={(_, v) => setKLowpass(v as number)} min={0} max={0.1} step={0.001} size="small"
                   sx={{ flex: 1, "& .MuiSlider-thumb": { width: 10, height: 10 } }} />
-                <Typography sx={{ ...typo.value, minWidth: 50 }}>{localKLowpass > 0 ? localKLowpass.toFixed(3) : "off"}</Typography>
+                <Typography sx={{ ...typo.value, color: colors.textMuted, minWidth: 50 }}>{localKLowpass > 0 ? localKLowpass.toFixed(3) : "off"}</Typography>
               </Stack>
               <Stack direction="row" alignItems="center" gap={1}>
                 <Typography sx={{ ...typo.labelSmall, minWidth: 55 }}>k highpass:</Typography>
                 <Slider value={localKHighpass} onChange={(_, v) => setLocalKHighpass(v as number)}
                   onChangeCommitted={(_, v) => setKHighpass(v as number)} min={0} max={0.1} step={0.001} size="small"
                   sx={{ flex: 1, "& .MuiSlider-thumb": { width: 10, height: 10 } }} />
-                <Typography sx={{ ...typo.value, minWidth: 50 }}>{localKHighpass > 0 ? localKHighpass.toFixed(3) : "off"}</Typography>
+                <Typography sx={{ ...typo.value, color: colors.textMuted, minWidth: 50 }}>{localKHighpass > 0 ? localKHighpass.toFixed(3) : "off"}</Typography>
               </Stack>
               <Stack direction="row" alignItems="center" gap={1}>
                 <Typography sx={typo.labelSmall}>Damp:</Typography>
@@ -872,9 +855,44 @@ function ShowPDF4DWidget() {
                   <Slider value={localRCut} onChange={(_, v) => setLocalRCut(v as number)}
                     onChangeCommitted={(_, v) => setRCut(v as number)} min={0.1} max={5} step={0.1} size="small"
                     sx={{ width: 80, "& .MuiSlider-thumb": { width: 10, height: 10 } }} />
-                  <Typography sx={typo.value}>{localRCut.toFixed(1)} Å</Typography>
+                  <Typography sx={{ ...typo.value, color: colors.textMuted }}>{localRCut.toFixed(1)} Å</Typography>
                 </>)}
               </Stack>
+              {plotMode === "gr" && (
+                <Stack direction="row" alignItems="center" gap={0}>
+                  <Typography sx={{ ...typo.labelSmall, minWidth: 55 }}>Density:</Typography>
+                  <Typography sx={typo.labelSmall}>Estimated</Typography>
+                  <Switch
+                    checked={densityMode === "manual"}
+                    onChange={(e) => setDensityMode(e.target.checked ? "manual" : "estimated")}
+                    size="small"
+                    sx={switchSmall}
+                  />
+                  <Typography sx={typo.labelSmall}>Manual</Typography>
+                  <input
+                    type="number"
+                    step="0.001"
+                    min={0}
+                    value={localDensity}
+                    disabled={densityMode === "estimated"}
+                    onChange={(e) => setLocalDensity(e.target.value)}
+                    onBlur={() => {
+                      const v = parseFloat(localDensity);
+                      if (!isNaN(v) && v > 0 && v !== densityValue) setDensityValue(v);
+                      else setLocalDensity(densityValue.toPrecision(4));
+                    }}
+                    onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+                    style={{
+                      width: 90, fontSize: 12, padding: "3px 6px", marginLeft: SPACING.LG, fontFamily: MONO,
+                      border: `1px solid ${colors.border}`,
+                      background: densityMode === "estimated" ? (isDark ? "#222" : "#f0f0f0") : (isDark ? "#1a1a1a" : "#fff"),
+                      color: colors.textMuted,
+                      outline: "none",
+                    }}
+                  />
+                  <Typography sx={{ ...typo.labelSmall, ml: `${SPACING.XS}px` }}>Å⁻³</Typography>
+                </Stack>
+              )}
             </Box>
           )}
         </Box>

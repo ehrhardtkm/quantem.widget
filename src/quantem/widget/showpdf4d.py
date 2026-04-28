@@ -22,8 +22,8 @@ from quantem.widget.json_state import (
 class ShowPDF4D(anywidget.AnyWidget):
     """Interactive pair distribution function (PDF) analysis widget for 4D-STEM data.
 
-    Wraps ``PairDistributionFunction`` from ``quantem.diffraction`` and provides:
-    - A scan-space navigation image with a paintable inclusion mask (left panel)
+    Wraps ``PairDistributionFunction`` from ``quantem.diffraction``. This widget provides:
+    - A real-space navigation image with masking function (left panel)
     - Real-time 1D curve plots for I(k)+B(k), windowed F(k), and G(r) (right panel)
     - Tunable PDF parameters (k-range, window, damping) with live feedback
     """
@@ -73,6 +73,10 @@ class ShowPDF4D(anywidget.AnyWidget):
     gr_x_bytes = traitlets.Bytes(b"").tag(sync=True)
     gr_y_bytes = traitlets.Bytes(b"").tag(sync=True)
     n_points_gr = traitlets.Int(0).tag(sync=True)
+    # g(r) pair distribution function
+    pdf_x_bytes = traitlets.Bytes(b"").tag(sync=True)
+    pdf_y_bytes = traitlets.Bytes(b"").tag(sync=True)
+    n_points_pdf = traitlets.Int(0).tag(sync=True)
 
     # =========================================================================
     # PDF parameters (user-tunable, trigger recompute)
@@ -90,6 +94,11 @@ class ShowPDF4D(anywidget.AnyWidget):
     damp_origin_oscillations = traitlets.Bool(False).tag(sync=True)
     r_cut = traitlets.Float(1.0).tag(sync=True)
 
+    # Density for g(r) computation. mode: "estimated" (auto via estimate_density,
+    # shares r_cut with damping) or "manual" (user-supplied density_value).
+    density_mode = traitlets.Unicode("estimated").tag(sync=True)
+    density_value = traitlets.Float(0.05).tag(sync=True)
+
     # K-range metadata (read-only, set once from data, used for slider bounds)
     k_min_available = traitlets.Float(0.0).tag(sync=True)
     k_max_available = traitlets.Float(10.0).tag(sync=True)
@@ -99,7 +108,7 @@ class ShowPDF4D(anywidget.AnyWidget):
     # =========================================================================
     plot_mode = traitlets.Unicode("Gr").tag(sync=True)
     show_background = traitlets.Bool(True).tag(sync=True)
-    cmap = traitlets.Unicode("inferno").tag(sync=True)
+    cmap = traitlets.Unicode("gray").tag(sync=True)
     log_scale = traitlets.Bool(False).tag(sync=True)
     auto_contrast = traitlets.Bool(True).tag(sync=True)
     show_stats = traitlets.Bool(True).tag(sync=True)
@@ -140,10 +149,13 @@ class ShowPDF4D(anywidget.AnyWidget):
         r_step=0.02,
         damp_origin_oscillations=False,
         r_cut=1.0,
+        # Density (for g(r))
+        density_mode="estimated",
+        density_value=0.05,
         # Display
         plot_mode="Gr",
         show_background=True,
-        cmap="inferno",
+        cmap="gray",
         log_scale=False,
         auto_contrast=True,
         show_stats=True,
@@ -210,9 +222,15 @@ class ShowPDF4D(anywidget.AnyWidget):
         self.k_min_available = float(qq[0])
         self.k_max_available = float(qq[-1])
 
-        # --- Default k_max_fit to ~80% of available range if not set ---
+        # --- Default k fit/window range to the full data range if not set ---
+        if k_min_fit == 0.0:
+            k_min_fit = float(qq[0])
         if k_max_fit == 0.0:
-            k_max_fit = float(qq[-1]) * 0.8
+            k_max_fit = float(qq[-1])
+        if k_min_window == 0.0:
+            k_min_window = float(qq[0])
+        if k_max_window == 0.0:
+            k_max_window = float(qq[-1])
 
         # --- Set parameter traits ---
         self.title = title or _extracted_title or "PDF"
@@ -227,6 +245,8 @@ class ShowPDF4D(anywidget.AnyWidget):
         self.r_step = r_step
         self.damp_origin_oscillations = damp_origin_oscillations
         self.r_cut = r_cut
+        self.density_mode = density_mode
+        self.density_value = float(density_value)
 
         # --- Set display traits ---
         self.plot_mode = plot_mode
@@ -273,6 +293,10 @@ class ShowPDF4D(anywidget.AnyWidget):
                 "damp_origin_oscillations",
                 "r_cut",
             ],
+        )
+        self.observe(
+            self._on_density_change,
+            names=["density_mode", "density_value"],
         )
 
         # --- Initial computation ---
@@ -331,6 +355,16 @@ class ShowPDF4D(anywidget.AnyWidget):
             return
         self._pdf.bg = None
         self._recompute_full()
+
+    def _on_density_change(self, change=None):
+        if self._initializing:
+            return
+        # In manual mode the user-supplied value is used directly; in estimated
+        # mode we invalidate the cached rho0 so estimate_density runs again
+        # against the current G(r).
+        if self.density_mode == "estimated":
+            self._pdf.rho0 = None
+        self._compute_gr()
 
     # =========================================================================
     # Core computation
@@ -397,31 +431,75 @@ class ShowPDF4D(anywidget.AnyWidget):
                 r_cut=self.r_cut,
             )
             self._sync_curves_to_js()
+            self._compute_gr()
             self.status_message = ""
         except Exception as e:
             self.status_message = f"Error: {e}"
         finally:
             self.computing = False
 
+    def _compute_gr(self):
+        """Compute g(r) via PairDistributionFunction.calculate_gr and sync to JS.
+
+        Density choice follows ``self.density_mode``:
+        - "manual": pass ``self.density_value`` to calculate_gr.
+        - "estimated": density=None → calculate_gr uses cached rho0 or runs
+          estimate_density (with the shared ``r_cut``). Result is written back
+          to ``self.density_value`` so the JS readout reflects the estimate.
+        """
+        if self._pdf._reduced_pdf is None or self._pdf._r is None:
+            self.n_points_pdf = 0
+            self.pdf_x_bytes = b""
+            self.pdf_y_bytes = b""
+            return
+        try:
+            if self.density_mode == "manual":
+                self._pdf.calculate_gr(
+                    density=float(self.density_value),
+                    r_cut=self.r_cut,
+                )
+            else:
+                self._pdf.calculate_gr(density=None, r_cut=self.r_cut)
+                if self._pdf.rho0 is not None:
+                    rho_est = float(self._pdf.rho0)
+                    if rho_est != self.density_value:
+                        # Update the displayed value without re-triggering the
+                        # density observer.
+                        self._initializing = True
+                        self.density_value = rho_est
+                        self._initializing = False
+        except Exception as e:
+            self.status_message = f"g(r) error: {e}"
+            self.n_points_pdf = 0
+            self.pdf_x_bytes = b""
+            self.pdf_y_bytes = b""
+            return
+
+        r = to_numpy(self._pdf._r).astype(np.float32)
+        gr_arr = to_numpy(self._pdf._pdf).astype(np.float32)
+        self.n_points_pdf = len(r)
+        self.pdf_x_bytes = r.tobytes()
+        self.pdf_y_bytes = gr_arr.tobytes()
+
     def _sync_curves_to_js(self):
         qq = np.asarray(self._pdf.qq, dtype=np.float32)
         self.n_points_ik = len(qq)
         self.ik_x_bytes = qq.tobytes()
         self.ik_y_bytes = (
-            self._pdf._to_numpy(self._pdf.Ik).astype(np.float32).tobytes()
+            to_numpy(self._pdf.Ik).astype(np.float32).tobytes()
         )
 
         # Background fit B(k)
         if self._pdf.bg is not None:
             self.ik_bg_y_bytes = (
-                self._pdf._to_numpy(self._pdf.bg).astype(np.float32).tobytes()
+                to_numpy(self._pdf.bg).astype(np.float32).tobytes()
             )
         else:
             self.ik_bg_y_bytes = b""
 
         # F(k) windowed (Lorch window applied)
         if self._pdf.Fk_masked is not None:
-            fk = self._pdf._to_numpy(self._pdf.Fk_masked).astype(np.float32)
+            fk = to_numpy(self._pdf.Fk_masked).astype(np.float32)
             self.n_points_fk = len(fk)
             self.fk_x_bytes = qq[: len(fk)].tobytes()
             self.fk_y_bytes = fk.tobytes()
@@ -437,8 +515,8 @@ class ShowPDF4D(anywidget.AnyWidget):
                 if self._pdf.reduced_pdf_damped is not None
                 else self._pdf._reduced_pdf
             )
-            r = self._pdf._to_numpy(self._pdf._r).astype(np.float32)
-            gr = self._pdf._to_numpy(Gr).astype(np.float32)
+            r = to_numpy(self._pdf._r).astype(np.float32)
+            gr = to_numpy(Gr).astype(np.float32)
             self.n_points_gr = len(r)
             self.gr_x_bytes = r.tobytes()
             self.gr_y_bytes = gr.tobytes()
@@ -530,6 +608,8 @@ class ShowPDF4D(anywidget.AnyWidget):
             "r_step": self.r_step,
             "damp_origin_oscillations": self.damp_origin_oscillations,
             "r_cut": self.r_cut,
+            "density_mode": self.density_mode,
+            "density_value": self.density_value,
             "plot_mode": self.plot_mode,
             "show_background": self.show_background,
             "cmap": self.cmap,

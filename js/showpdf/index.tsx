@@ -19,7 +19,8 @@ import {
   applyLogScale,
 } from "../stats";
 import { extractFloat32, formatNumber } from "../format";
-import { roundToNiceValue } from "../scalebar";
+import { roundToNiceValue, drawScaleBarHiDPI } from "../scalebar";
+import { computeToolVisibility } from "../tool-parity";
 
 // ============================================================================
 // Constants
@@ -97,7 +98,7 @@ function fillCircleMask(
 // ============================================================================
 // Main component
 // ============================================================================
-function ShowPDF4DWidget() {
+function ShowPDFWidget() {
   const model = useModel();
   const { colors } = useTheme();
   const isDark = colors.bg === "#1e1e1e";
@@ -107,6 +108,8 @@ function ShowPDF4DWidget() {
   const [scanRows] = useModelState<number>("scan_rows");
   const [scanCols] = useModelState<number>("scan_cols");
   const [navImageBytes] = useModelState<DataView>("nav_image_bytes");
+  const [navPixelSize] = useModelState<number>("nav_pixel_size");
+  const [navUnit] = useModelState<string>("nav_unit");
   const [maskPixelCount] = useModelState<number>("mask_pixel_count");
   const [maskFraction] = useModelState<number>("mask_fraction");
   const [maskVersion, setMaskVersion_model] = useModelState<number>("mask_version");
@@ -143,6 +146,22 @@ function ShowPDF4DWidget() {
   const [showControls] = useModelState<boolean>("show_controls");
   const [computing] = useModelState<boolean>("computing");
   const [statusMessage] = useModelState<string>("status_message");
+  const [analysisMode, setAnalysisMode] = useModelState<string>("analysis_mode");
+  const [disabledTools] = useModelState<string[]>("disabled_tools");
+  const [hiddenTools] = useModelState<string[]>("hidden_tools");
+  const toolVisibility = React.useMemo(
+    () => computeToolVisibility("ShowPDF", disabledTools ?? [], hiddenTools ?? []),
+    [disabledTools, hiddenTools],
+  );
+  const lockMask = toolVisibility.isLocked("mask");
+  const hideMask = toolVisibility.isHidden("mask");
+  const lockDisplay = toolVisibility.isLocked("display");
+  const lockParameters = toolVisibility.isLocked("parameters");
+  const hideParameters = toolVisibility.isHidden("parameters");
+  const hideStats = toolVisibility.isHidden("stats");
+  const [probeRow, setProbeRow] = useModelState<number>("probe_row");
+  const [probeCol, setProbeCol] = useModelState<number>("probe_col");
+  const [probeSize, setProbeSize] = useModelState<number>("probe_size");
 
   // --- Local state ---
   const PLOT_H = 360;
@@ -161,6 +180,9 @@ function ShowPDF4DWidget() {
   const [plotYMax, setPlotYMax] = React.useState(1);
   const [ikLogScale, setIkLogScale] = React.useState(true);
   const [cursorData, setCursorData] = React.useState<{ x: number; y: number } | null>(null);
+  const [localProbe, setLocalProbe] = React.useState<{ row: number; col: number }>({ row: probeRow, col: probeCol });
+  const probeGenRef = React.useRef(0);
+  const isDraggingProbeRef = React.useRef(false);
   const [localKFit, setLocalKFit] = React.useState<[number, number]>([kMinFit, kMaxFit]);
   const [localKWin, setLocalKWin] = React.useState<[number, number]>([kMinWindow, kMaxWindow]);
   const [localRMax, setLocalRMax] = React.useState(rMax);
@@ -177,11 +199,13 @@ function ShowPDF4DWidget() {
   React.useEffect(() => { setLocalKHighpass(kHighpass); }, [kHighpass]);
   React.useEffect(() => { setLocalRCut(rCut); }, [rCut]);
   React.useEffect(() => { setLocalDensity(densityValue.toPrecision(4)); }, [densityValue]);
+  React.useEffect(() => { setLocalProbe({ row: probeRow, col: probeCol }); }, [probeRow, probeCol]);
 
   const userZoomedRef = React.useRef(false);
 
   // --- Refs ---
   const navCanvasRef = React.useRef<HTMLCanvasElement>(null);
+  const navUiRef = React.useRef<HTMLCanvasElement>(null);  // High-DPI overlay for scale bar
   const navOverlayRef = React.useRef<HTMLCanvasElement>(null);
   const navOffscreenRef = React.useRef<HTMLCanvasElement | null>(null);
   const navImgDataRef = React.useRef<ImageData | null>(null);
@@ -284,12 +308,23 @@ function ShowPDF4DWidget() {
   }, [dataVersion, navZoom, navPanX, navPanY, navH, scanCols, scanRows]);
 
   // =========================================================================
+  // Effect 3b: Nav scale bar (HiDPI overlay)
+  // =========================================================================
+  React.useEffect(() => {
+    const cvs = navUiRef.current;
+    if (!cvs) return;
+    cvs.width = NAV_SIZE * DPR;
+    cvs.height = navH * DPR;
+    const unit = (navUnit === "Å" ? "Å" : "px") as "Å" | "px";
+    drawScaleBarHiDPI(cvs, DPR, navZoom, navPixelSize || 1, unit, scanCols);
+  }, [navZoom, navPanX, navPanY, navPixelSize, navUnit, scanCols, scanRows, navH]);
+
+  // =========================================================================
   // Effect 4: Render mask overlay
   // =========================================================================
   React.useLayoutEffect(() => {
     const cvs = navOverlayRef.current;
-    const mask = maskRef.current;
-    if (!cvs || !mask || mask.length === 0) return;
+    if (!cvs) return;
     const w = NAV_SIZE * DPR;
     const h = navH * DPR;
     cvs.width = w;
@@ -297,6 +332,40 @@ function ShowPDF4DWidget() {
     const ctx = cvs.getContext("2d");
     if (!ctx) return;
     ctx.clearRect(0, 0, w, h);
+    const scX = (NAV_SIZE * DPR) / Math.max(scanCols, 1);
+    const scY = (navH * DPR) / Math.max(scanRows, 1);
+
+    // Probe mode: draw a single circle inscribed in the synthetic square at (localProbe).
+    if (analysisMode === "probe") {
+      const half = Math.max(0, probeSize - 1);
+      const r0 = localProbe.row - half;
+      const c0 = localProbe.col - half;
+      const sideScan = 2 * half + 1;
+      const sx = c0 * scX;
+      const sy = r0 * scY;
+      const sw = sideScan * scX;
+      const sh = sideScan * scY;
+      ctx.save();
+      ctx.translate(w / 2 + navPanX * DPR, h / 2 + navPanY * DPR);
+      ctx.scale(navZoom, navZoom);
+      ctx.translate(-w / 2, -h / 2);
+      // Translucent fill of the square footprint (data actually used)
+      ctx.fillStyle = "rgba(100,200,255,0.18)";
+      ctx.fillRect(sx, sy, sw, sh);
+      // Inscribed circle outline (visual probe)
+      ctx.strokeStyle = "rgba(100,200,255,1.0)";
+      ctx.lineWidth = 2 / navZoom;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.ellipse(sx + sw / 2, sy + sh / 2, sw / 2, sh / 2, 0, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+      return;
+    }
+
+    // Mask mode: paint excluded pixels with a translucent overlay.
+    const mask = maskRef.current;
+    if (!mask || mask.length === 0) return;
     const mc = document.createElement("canvas");
     mc.width = scanCols;
     mc.height = scanRows;
@@ -343,7 +412,7 @@ function ShowPDF4DWidget() {
       }
       ctx.restore();
     }
-  }, [maskRenderVersion, navZoom, navPanX, navPanY, navH, scanRows, scanCols, shapePreview, maskAction, maskTool]);
+  }, [maskRenderVersion, navZoom, navPanX, navPanY, navH, scanRows, scanCols, shapePreview, maskAction, maskTool, analysisMode, localProbe, probeSize]);
 
   // =========================================================================
   // Effect 5: Parse curve bytes + auto-fit
@@ -512,7 +581,7 @@ function ShowPDF4DWidget() {
       ctx.fillRect(mL, mT, pw, ph);
     }
   }, [PLOT_W, PLOT_H, plotXMin, plotXMax, plotYMin, plotYMax, plotMode, showBackground, ikLogScale, cursorData, computing, isDark,
-      ikXBytes, ikYBytes, ikBgYBytes, fkXBytes, fkYBytes, grXBytes, grYBytes]);
+      ikXBytes, ikYBytes, ikBgYBytes, fkXBytes, fkYBytes, grXBytes, grYBytes, pdfXBytes, pdfYBytes]);
 
   // =========================================================================
   // Nav mouse handlers
@@ -543,15 +612,36 @@ function ShowPDF4DWidget() {
     setMaskVersion_model(maskVersionRef.current);
   }
 
+  // Live probe move with rAF coalescing — accumulates rapid mousemoves and
+  // sends at most one model.set per display frame.
+  function syncProbeRAF(row: number, col: number) {
+    const r = Math.max(0, Math.min(scanRows - 1, row));
+    const c = Math.max(0, Math.min(scanCols - 1, col));
+    setLocalProbe({ row: r, col: c });
+    const gen = ++probeGenRef.current;
+    requestAnimationFrame(() => {
+      if (gen !== probeGenRef.current) return;
+      if (r !== probeRow) setProbeRow(r);
+      if (c !== probeCol) setProbeCol(c);
+    });
+  }
+
   const handleNavMouseDown = (e: React.MouseEvent) => {
     if (!maskRef.current) return;
     e.preventDefault();
     if (e.button === 1 || (e.button === 0 && e.altKey)) {
+      if (lockDisplay) return;  // pan locked
       isPanningRef.current = true;
       panStartRef.current = { x: e.clientX, y: e.clientY, px: navPanX, py: navPanY };
       return;
     }
+    if (lockMask) return;  // mask group locked: blocks paint AND probe drag
     const { row, col } = screenToImage(e);
+    if (analysisMode === "probe") {
+      isDraggingProbeRef.current = true;
+      syncProbeRAF(row, col);
+      return;
+    }
     // "+" adds to the mask (excludes the area from analysis = 0);
     // "-" removes from the mask (re-includes the area = 1).
     const value = maskAction === "add" ? 0 : 1;
@@ -574,6 +664,10 @@ function ShowPDF4DWidget() {
       return;
     }
     const { row, col } = screenToImage(e);
+    if (isDraggingProbeRef.current) {
+      syncProbeRAF(row, col);
+      return;
+    }
     if (isPaintingRef.current && maskRef.current) {
       const half = maskBrushSize - 1;
       fillRectMask(maskRef.current, scanCols, scanRows, row - half, col - half, row + half, col + half, maskAction === "add" ? 0 : 1);
@@ -585,6 +679,7 @@ function ShowPDF4DWidget() {
 
   const handleNavMouseUp = () => {
     if (isPanningRef.current) { isPanningRef.current = false; panStartRef.current = null; return; }
+    if (isDraggingProbeRef.current) { isDraggingProbeRef.current = false; return; }
     if (isPaintingRef.current) { isPaintingRef.current = false; syncMaskToPython(); return; }
     if (isDraggingShapeRef.current && shapeStartRef.current && maskRef.current && shapePreview) {
       const value = maskAction === "add" ? 0 : 1;
@@ -602,6 +697,7 @@ function ShowPDF4DWidget() {
 
   const handleNavWheel = (e: React.WheelEvent) => {
     e.preventDefault(); e.stopPropagation();
+    if (lockDisplay) return;  // zoom locked
     setNavZoom((z) => Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z * (e.deltaY > 0 ? 0.9 : 1.1))));
   };
 
@@ -623,6 +719,7 @@ function ShowPDF4DWidget() {
 
   const handlePlotMouseDown = (e: React.MouseEvent) => {
     e.preventDefault();
+    if (lockDisplay) return;  // pan locked
     isPlotPanRef.current = true;
     plotPanStartRef.current = { mx: e.clientX, my: e.clientY, xMin: plotXMin, xMax: plotXMax, yMin: plotYMin, yMax: plotYMax };
   };
@@ -648,6 +745,7 @@ function ShowPDF4DWidget() {
 
   const handlePlotWheel = (e: React.WheelEvent) => {
     e.preventDefault(); e.stopPropagation();
+    if (lockDisplay) return;  // zoom locked
     const d = plotScreenToData(e);
     if (!d) return;
     const f = e.deltaY > 0 ? 1.1 : 1 / 1.1;
@@ -662,8 +760,8 @@ function ShowPDF4DWidget() {
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
     switch (e.key.toLowerCase()) {
-      case "r": setNavZoom(1); setNavPanX(0); setNavPanY(0); userZoomedRef.current = false; autoFitPlot(); break;
-      case "x": setMaskAction((a) => {
+      case "r": if (!lockDisplay) { setNavZoom(1); setNavPanX(0); setNavPanY(0); userZoomedRef.current = false; autoFitPlot(); } break;
+      case "x": if (!lockMask) setMaskAction((a) => {
           if (maskRef.current) {
             maskRef.current.fill(a === "add" ? 0 : 1);
             setMaskRenderVersion((v) => v + 1);
@@ -672,10 +770,10 @@ function ShowPDF4DWidget() {
           return a === "add" ? "subtract" : "add";
         }); break;
       case "c":
-        if (maskRef.current) { maskRef.current.fill(1); setMaskRenderVersion((v) => v + 1); syncMaskToPython(); }
+        if (!lockMask && maskRef.current) { maskRef.current.fill(1); setMaskRenderVersion((v) => v + 1); syncMaskToPython(); }
         break;
       case "i":
-        if (maskRef.current) { for (let i = 0; i < maskRef.current.length; i++) maskRef.current[i] = maskRef.current[i] ? 0 : 1; setMaskRenderVersion((v) => v + 1); syncMaskToPython(); }
+        if (!lockMask && maskRef.current) { for (let i = 0; i < maskRef.current.length; i++) maskRef.current[i] = maskRef.current[i] ? 0 : 1; setMaskRenderVersion((v) => v + 1); syncMaskToPython(); }
         break;
       case "1": setPlotMode("Ik"); break;
       case "2": setPlotMode("Fk"); break;
@@ -725,14 +823,23 @@ function ShowPDF4DWidget() {
         <Box sx={{ width: NAV_SIZE }}>
           <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, minHeight: 32, flexWrap: "wrap", rowGap: `${SPACING.XS}px` }}>
             <span style={{ fontSize: 12, fontFamily: FONT, color: colors.textMuted }}>Scan ({scanRows}×{scanCols})</span>
-            <Stack direction="row" spacing={`2px`} alignItems="center">
+            <Stack direction="row" alignItems="center" gap={0}>
+              <Typography sx={typo.labelSmall}>Mask</Typography>
+              <Switch checked={analysisMode === "probe"} disabled={lockMask}
+                onChange={(e) => setAnalysisMode(e.target.checked ? "probe" : "mask")}
+                size="small" sx={switchSmall} />
+              <Typography sx={typo.labelSmall}>Probe</Typography>
+            </Stack>
+          </Stack>
+          {analysisMode === "mask" && !hideMask && (
+            <Stack direction="row" spacing={`2px`} alignItems="center" sx={{ mb: `${SPACING.XS}px`, flexWrap: "wrap", rowGap: `${SPACING.XS}px` }}>
               {(["rectangle", "circle", "freeform"] as const).map((tool) => (
-                <Button key={tool} size="small" variant={maskTool === tool ? "contained" : "outlined"}
+                <Button key={tool} size="small" variant={maskTool === tool ? "contained" : "outlined"} disabled={lockMask}
                   sx={{ ...compactBtn, minWidth: 24 }} onClick={() => setMaskTool(tool)}>
                   {tool === "rectangle" ? "▭" : tool === "circle" ? "○" : "✎"}
                 </Button>
               ))}
-              <Button size="small" variant={maskAction === "add" ? "contained" : "outlined"}
+              <Button size="small" variant={maskAction === "add" ? "contained" : "outlined"} disabled={lockMask}
                 sx={{ ...compactBtn, minWidth: 24 }} color={maskAction === "add" ? "primary" : "error"}
                 onClick={() => setMaskAction((a) => {
                   if (!maskRef.current) return a === "add" ? "subtract" : "add";
@@ -749,27 +856,39 @@ function ShowPDF4DWidget() {
                 })}>
                 {maskAction === "add" ? "+" : "−"}
               </Button>
-              <Button size="small" sx={compactBtn} onClick={() => { if (maskRef.current) { maskRef.current.fill(1); setMaskRenderVersion((v) => v + 1); syncMaskToPython(); } }}>Clear</Button>
-              <Button size="small" sx={compactBtn} onClick={() => { if (maskRef.current) { for (let i = 0; i < maskRef.current.length; i++) maskRef.current[i] = maskRef.current[i] ? 0 : 1; setMaskRenderVersion((v) => v + 1); syncMaskToPython(); } }}>Invert</Button>
+              <Button size="small" sx={compactBtn} disabled={lockMask} onClick={() => { if (maskRef.current) { maskRef.current.fill(1); setMaskRenderVersion((v) => v + 1); syncMaskToPython(); } }}>Clear</Button>
+              <Button size="small" sx={compactBtn} disabled={lockMask} onClick={() => { if (maskRef.current) { for (let i = 0; i < maskRef.current.length; i++) maskRef.current[i] = maskRef.current[i] ? 0 : 1; setMaskRenderVersion((v) => v + 1); syncMaskToPython(); } }}>Invert</Button>
             </Stack>
-          </Stack>
+          )}
           <Box sx={imageBox} style={{ width: NAV_SIZE, height: navH }}>
             <canvas ref={navCanvasRef} style={{ width: NAV_SIZE, height: navH, display: "block" }} />
             <canvas ref={navOverlayRef} style={{ position: "absolute", top: 0, left: 0, width: NAV_SIZE, height: navH, pointerEvents: "none" }} />
-            <div style={{ position: "absolute", inset: 0, cursor: maskTool === "freeform" ? "crosshair" : "default" }}
+            <canvas ref={navUiRef} style={{ position: "absolute", top: 0, left: 0, width: NAV_SIZE, height: navH, pointerEvents: "none" }} />
+            <div style={{ position: "absolute", inset: 0, cursor: analysisMode === "probe" || maskTool === "freeform" ? "crosshair" : "default" }}
               onMouseDown={handleNavMouseDown} onMouseMove={handleNavMouseMove} onMouseUp={handleNavMouseUp}
-              onMouseLeave={() => { isPaintingRef.current = false; isDraggingShapeRef.current = false; setShapePreview(null); }}
+              onMouseLeave={() => { isPaintingRef.current = false; isDraggingShapeRef.current = false; isDraggingProbeRef.current = false; setShapePreview(null); }}
               onWheel={handleNavWheel} />
           </Box>
-          {showStats && <div style={{ fontSize: 12, fontFamily: MONO, color: colors.textMuted, marginTop: SPACING.XS }}>{maskPixelCount} / {scanRows * scanCols} included ({(maskFraction * 100).toFixed(1)}%)</div>}
+          {showStats && !hideStats && <div style={{ fontSize: 12, fontFamily: MONO, color: colors.textMuted, marginTop: SPACING.XS }}>{maskPixelCount} / {scanRows * scanCols} included ({(maskFraction * 100).toFixed(1)}%)</div>}
           {showControls && (
             <Box sx={{ mt: `${SPACING.SM}px` }}>
-              {maskTool === "freeform" && (
+              {analysisMode === "mask" && maskTool === "freeform" && (
                 <Stack direction="row" alignItems="center" gap={1} sx={{ mb: `${SPACING.XS}px` }}>
                   <Typography sx={typo.labelSmall}>Brush:</Typography>
-                  <Slider value={maskBrushSize} onChange={(_, v) => setMaskBrushSize(v as number)} min={1} max={20} size="small"
+                  <Slider value={maskBrushSize} onChange={(_, v) => setMaskBrushSize(v as number)} disabled={lockMask} min={1} max={20} size="small"
                     sx={{ width: 80, "& .MuiSlider-thumb": { width: 10, height: 10 } }} />
                   <Typography sx={typo.value}>{maskBrushSize}</Typography>
+                </Stack>
+              )}
+              {analysisMode === "probe" && (
+                <Stack direction="row" alignItems="center" gap={1} sx={{ mb: `${SPACING.XS}px` }}>
+                  <Typography sx={typo.labelSmall}>Probe:</Typography>
+                  <Slider value={probeSize} onChange={(_, v) => setProbeSize(v as number)} disabled={lockMask} min={1} max={20} size="small"
+                    sx={{ width: 80, "& .MuiSlider-thumb": { width: 10, height: 10 } }} />
+                  <Typography sx={typo.value}>{probeSize}</Typography>
+                  <Typography sx={{ ...typo.value, color: colors.textMuted, ml: `${SPACING.SM}px` }}>
+                    @({localProbe.row}, {localProbe.col})
+                  </Typography>
                 </Stack>
               )}
               <Stack direction="row" alignItems="center" gap={1}>
@@ -784,6 +903,14 @@ function ShowPDF4DWidget() {
 
         {/* RIGHT: Curves */}
         <Box sx={{ width: PLOT_W, flexShrink: 0 }}>
+          {/* Spacer matching the height of the left-panel mask-tools row, so
+              both canvases sit at the same vertical position in mask mode. */}
+          {analysisMode === "mask" && (
+            <Stack direction="row" spacing={`2px`} alignItems="center" aria-hidden
+              sx={{ mb: `${SPACING.XS}px`, flexWrap: "wrap", rowGap: `${SPACING.XS}px`, visibility: "hidden" }}>
+              <Button size="small" sx={{ ...compactBtn, minWidth: 24 }}>▭</Button>
+            </Stack>
+          )}
           <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, minHeight: 32, flexWrap: "wrap", rowGap: `${SPACING.XS}px` }}>
             <Stack direction="row" spacing={`${SPACING.XS}px`}>
               {([["Ik", "I(k)"], ["Fk", "F(k)"], ["Gr", "G(r)"], ["gr", "g(r)"]] as const).map(([mode, label]) => (
@@ -796,25 +923,25 @@ function ShowPDF4DWidget() {
                 <Switch checked={ikLogScale} onChange={(e) => { setIkLogScale(e.target.checked); userZoomedRef.current = false; setTimeout(autoFitPlot, 0); }} size="small" sx={switchSmall} />
                 <Typography sx={typo.labelSmall}>Background:</Typography>
                 <Switch checked={showBackground} onChange={(e) => setShowBackground(e.target.checked)} size="small" sx={switchSmall} /></>)}
-              <Button size="small" sx={compactBtn} onClick={() => { userZoomedRef.current = false; autoFitPlot(); }}>Reset</Button>
+              <Button size="small" sx={compactBtn} disabled={lockDisplay} onClick={() => { userZoomedRef.current = false; autoFitPlot(); }}>Reset</Button>
             </Stack>
           </Stack>
           <Box sx={imageBox} style={{ width: PLOT_W, height: PLOT_H }}>
             <canvas ref={plotCanvasRef} style={{ width: PLOT_W, height: PLOT_H, display: "block" }}
               onMouseDown={handlePlotMouseDown} onMouseMove={handlePlotMouseMove} onMouseUp={handlePlotMouseUp}
               onMouseLeave={() => { isPlotPanRef.current = false; setCursorData(null); }}
-              onDoubleClick={() => { userZoomedRef.current = false; autoFitPlot(); }} onWheel={handlePlotWheel} />
+              onDoubleClick={() => { if (!lockDisplay) { userZoomedRef.current = false; autoFitPlot(); } }} onWheel={handlePlotWheel} />
           </Box>
-          {showStats && cursorData && <Typography sx={{ ...typo.value, mt: `${SPACING.XS}px` }}>
+          {showStats && !hideStats && cursorData && <Typography sx={{ ...typo.value, mt: `${SPACING.XS}px` }}>
             {(plotMode === "Gr" || plotMode === "gr") ? "r" : "k"} = {formatNumber(cursorData.x, 4)}, {plotMode === "Ik" ? "I" : plotMode === "Fk" ? "F" : plotMode === "gr" ? "g" : "G"} = {formatNumber(plotMode === "Ik" && ikLogScale ? Math.pow(10, cursorData.y) : cursorData.y, 4)}
           </Typography>}
-          {showControls && (
+          {showControls && !hideParameters && (
             <Box sx={{ mt: `${SPACING.SM}px`, display: "flex", flexDirection: "column", gap: `${SPACING.XS}px` }}>
               <Stack direction="row" alignItems="center" gap={1}>
                 <Typography sx={{ ...typo.labelSmall, minWidth: 55 }}>k fit:</Typography>
                 <Slider value={localKFit} onChange={(_, v) => setLocalKFit(v as [number, number])}
                   onChangeCommitted={(_, v) => { const val = v as [number, number]; setKMinFit(val[0]); setKMaxFit(val[1]); }}
-                  min={kMinAvail} max={kMaxAvail} step={0.01} size="small"
+                  disabled={lockParameters} min={kMinAvail} max={kMaxAvail} step={0.01} size="small"
                   sx={{ flex: 1, "& .MuiSlider-thumb": { width: 10, height: 10 } }} />
                 <Typography sx={{ ...typo.value, color: colors.textMuted, minWidth: 90 }}>[{localKFit[0].toFixed(2)}, {localKFit[1].toFixed(2)}]</Typography>
               </Stack>
@@ -822,38 +949,38 @@ function ShowPDF4DWidget() {
                 <Typography sx={{ ...typo.labelSmall, minWidth: 55 }}>k window:</Typography>
                 <Slider value={localKWin} onChange={(_, v) => setLocalKWin(v as [number, number])}
                   onChangeCommitted={(_, v) => { const val = v as [number, number]; setKMinWindow(val[0]); setKMaxWindow(val[1]); }}
-                  min={kMinAvail} max={kMaxAvail} step={0.01} size="small"
+                  disabled={lockParameters} min={kMinAvail} max={kMaxAvail} step={0.01} size="small"
                   sx={{ flex: 1, "& .MuiSlider-thumb": { width: 10, height: 10 } }} />
                 <Typography sx={{ ...typo.value, color: colors.textMuted, minWidth: 90 }}>[{localKWin[0].toFixed(2)}, {localKWin[1].toFixed(2)}]</Typography>
               </Stack>
               <Stack direction="row" alignItems="center" gap={1}>
                 <Typography sx={{ ...typo.labelSmall, minWidth: 55 }}>r max:</Typography>
                 <Slider value={localRMax} onChange={(_, v) => setLocalRMax(v as number)}
-                  onChangeCommitted={(_, v) => setRMax(v as number)} min={1} max={50} step={0.5} size="small"
+                  onChangeCommitted={(_, v) => setRMax(v as number)} disabled={lockParameters} min={1} max={50} step={0.5} size="small"
                   sx={{ flex: 1, "& .MuiSlider-thumb": { width: 10, height: 10 } }} />
                 <Typography sx={{ ...typo.value, color: colors.textMuted, minWidth: 50 }}>{localRMax.toFixed(1)} Å</Typography>
               </Stack>
               <Stack direction="row" alignItems="center" gap={1}>
                 <Typography sx={{ ...typo.labelSmall, minWidth: 55 }}>k lowpass:</Typography>
                 <Slider value={localKLowpass} onChange={(_, v) => setLocalKLowpass(v as number)}
-                  onChangeCommitted={(_, v) => setKLowpass(v as number)} min={0} max={0.1} step={0.001} size="small"
+                  onChangeCommitted={(_, v) => setKLowpass(v as number)} disabled={lockParameters} min={0} max={0.1} step={0.001} size="small"
                   sx={{ flex: 1, "& .MuiSlider-thumb": { width: 10, height: 10 } }} />
                 <Typography sx={{ ...typo.value, color: colors.textMuted, minWidth: 50 }}>{localKLowpass > 0 ? localKLowpass.toFixed(3) : "off"}</Typography>
               </Stack>
               <Stack direction="row" alignItems="center" gap={1}>
                 <Typography sx={{ ...typo.labelSmall, minWidth: 55 }}>k highpass:</Typography>
                 <Slider value={localKHighpass} onChange={(_, v) => setLocalKHighpass(v as number)}
-                  onChangeCommitted={(_, v) => setKHighpass(v as number)} min={0} max={0.1} step={0.001} size="small"
+                  onChangeCommitted={(_, v) => setKHighpass(v as number)} disabled={lockParameters} min={0} max={0.1} step={0.001} size="small"
                   sx={{ flex: 1, "& .MuiSlider-thumb": { width: 10, height: 10 } }} />
                 <Typography sx={{ ...typo.value, color: colors.textMuted, minWidth: 50 }}>{localKHighpass > 0 ? localKHighpass.toFixed(3) : "off"}</Typography>
               </Stack>
               <Stack direction="row" alignItems="center" gap={1}>
                 <Typography sx={typo.labelSmall}>Damp:</Typography>
-                <Switch checked={dampOrigin} onChange={(e) => setDampOrigin(e.target.checked)} size="small" sx={switchSmall} />
+                <Switch checked={dampOrigin} disabled={lockParameters} onChange={(e) => setDampOrigin(e.target.checked)} size="small" sx={switchSmall} />
                 {dampOrigin && (<>
                   <Typography sx={{ ...typo.labelSmall, ml: 1 }}>r_cut:</Typography>
                   <Slider value={localRCut} onChange={(_, v) => setLocalRCut(v as number)}
-                    onChangeCommitted={(_, v) => setRCut(v as number)} min={0.1} max={5} step={0.1} size="small"
+                    onChangeCommitted={(_, v) => setRCut(v as number)} disabled={lockParameters} min={0.1} max={5} step={0.1} size="small"
                     sx={{ width: 80, "& .MuiSlider-thumb": { width: 10, height: 10 } }} />
                   <Typography sx={{ ...typo.value, color: colors.textMuted }}>{localRCut.toFixed(1)} Å</Typography>
                 </>)}
@@ -864,6 +991,7 @@ function ShowPDF4DWidget() {
                   <Typography sx={typo.labelSmall}>Estimated</Typography>
                   <Switch
                     checked={densityMode === "manual"}
+                    disabled={lockParameters}
                     onChange={(e) => setDensityMode(e.target.checked ? "manual" : "estimated")}
                     size="small"
                     sx={switchSmall}
@@ -874,7 +1002,7 @@ function ShowPDF4DWidget() {
                     step="0.001"
                     min={0}
                     value={localDensity}
-                    disabled={densityMode === "estimated"}
+                    disabled={lockParameters || densityMode === "estimated"}
                     onChange={(e) => setLocalDensity(e.target.value)}
                     onBlur={() => {
                       const v = parseFloat(localDensity);
@@ -901,4 +1029,4 @@ function ShowPDF4DWidget() {
   );
 }
 
-export const render = createRender(ShowPDF4DWidget);
+export const render = createRender(ShowPDFWidget);

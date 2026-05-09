@@ -8,7 +8,6 @@ import anywidget
 import numpy as np
 import traitlets
 
-from quantem.core.config import validate_device
 from quantem.diffraction import PairDistributionFunction
 from quantem.widget.array_utils import to_numpy
 from quantem.widget.detector import virtual_images
@@ -19,7 +18,7 @@ from quantem.widget.json_state import (
 )
 
 
-class ShowPDF4D(anywidget.AnyWidget):
+class ShowPDF(anywidget.AnyWidget):
     """Interactive pair distribution function (PDF) analysis widget for 4D-STEM data.
 
     Wraps ``PairDistributionFunction`` from ``quantem.diffraction``. This widget provides:
@@ -28,7 +27,7 @@ class ShowPDF4D(anywidget.AnyWidget):
     - Tunable PDF parameters (k-range, window, damping) with live feedback
     """
 
-    _esm = pathlib.Path(__file__).parent / "static" / "showpdf4d.js"
+    _esm = pathlib.Path(__file__).parent / "static" / "showpdf.js"
 
     # =========================================================================
     # Version
@@ -44,6 +43,11 @@ class ShowPDF4D(anywidget.AnyWidget):
     nav_image_bytes = traitlets.Bytes(b"").tag(sync=True)
     nav_data_min = traitlets.Float(0.0).tag(sync=True)
     nav_data_max = traitlets.Float(1.0).tag(sync=True)
+    # Real-space scan calibration for the nav panel scalebar. Set from
+    # input_data.sampling[0] / units[0] when the dataset is loaded; defaults
+    # to "px" with size 1.0 when no calibration is present.
+    nav_pixel_size = traitlets.Float(1.0).tag(sync=True)
+    nav_unit = traitlets.Unicode("px").tag(sync=True)
 
     # =========================================================================
     # Mask (bidirectional — JS paints, Python reads)
@@ -56,6 +60,17 @@ class ShowPDF4D(anywidget.AnyWidget):
     mask_brush_size = traitlets.Int(5).tag(sync=True)
     mask_pixel_count = traitlets.Int(0).tag(sync=True)
     mask_fraction = traitlets.Float(0.0).tag(sync=True)
+
+    # =========================================================================
+    # Analysis mode: "mask" (existing painted mask) or "probe" (single moveable
+    # square region of side 2*probe_size-1 centered on the scan grid).
+    # In probe mode, mask_b64 is ignored and a synthetic mask is built from
+    # probe_row/probe_col/probe_size.
+    # =========================================================================
+    analysis_mode = traitlets.Unicode("mask").tag(sync=True)
+    probe_row = traitlets.Int(0).tag(sync=True)
+    probe_col = traitlets.Int(0).tag(sync=True)
+    probe_size = traitlets.Int(1).tag(sync=True)
 
     # =========================================================================
     # 1D curve data (synced to JS, all updated on every recompute)
@@ -152,6 +167,11 @@ class ShowPDF4D(anywidget.AnyWidget):
         # Density (for g(r))
         density_mode="estimated",
         density_value=0.05,
+        # Analysis mode + probe geometry
+        analysis_mode="mask",
+        probe_row=None,
+        probe_col=None,
+        probe_size=1,
         # Display
         plot_mode="Gr",
         show_background=True,
@@ -170,6 +190,8 @@ class ShowPDF4D(anywidget.AnyWidget):
         radial_step=1.0,
         two_fold_rotation_symmetry=False,
         device=None,
+        # Real-space scale bar (overrides auto-detect from ds.sampling/units)
+        pixel_size=None,
         # Tool lock/hide
         disabled_tools=None,
         hidden_tools=None,
@@ -194,9 +216,14 @@ class ShowPDF4D(anywidget.AnyWidget):
             if hasattr(data, "array") and hasattr(data, "name"):
                 _extracted_title = _extracted_title or (data.name or "")
 
-            # Resolve device
+            # Resolve device. PairDistributionFunction uses float64 tensors
+            # internally, which MPS does not support and which AMD/embedded
+            # GPU drivers handle inconsistently. The compute is light (1D
+            # FFTs, radial mean, iterative density solver), so default to CPU
+            # for cross-platform reliability. Users can still pass
+            # device="cuda" explicitly if they have a confirmed-working GPU.
             if device is None:
-                device_str, _ = validate_device(None)
+                device_str = "cpu"
             else:
                 device_str = device
 
@@ -247,6 +274,10 @@ class ShowPDF4D(anywidget.AnyWidget):
         self.r_cut = r_cut
         self.density_mode = density_mode
         self.density_value = float(density_value)
+        self.analysis_mode = analysis_mode
+        self.probe_row = int(probe_row) if probe_row is not None else self.scan_rows // 2
+        self.probe_col = int(probe_col) if probe_col is not None else self.scan_cols // 2
+        self.probe_size = int(probe_size)
 
         # --- Set display traits ---
         self.plot_mode = plot_mode
@@ -270,6 +301,10 @@ class ShowPDF4D(anywidget.AnyWidget):
         self.nav_data_min = float(nav_img.min())
         self.nav_data_max = float(nav_img.max())
         self.nav_image_bytes = nav_img.tobytes()
+        self.nav_pixel_size, self.nav_unit = self._resolve_nav_calibration()
+        if pixel_size is not None:
+            self.nav_pixel_size = float(pixel_size)
+            self.nav_unit = "Å"
 
         # --- Register observers ---
         self.observe(self._on_mask_change, names=["mask_version"])
@@ -298,14 +333,20 @@ class ShowPDF4D(anywidget.AnyWidget):
             self._on_density_change,
             names=["density_mode", "density_value"],
         )
+        self.observe(
+            self._on_probe_change,
+            names=["analysis_mode", "probe_row", "probe_col", "probe_size"],
+        )
 
         # --- Initial computation ---
         self._initializing = False
         self._update_mask_stats()
         self._recompute_full()
 
+        # Preserve any error message _recompute_full set instead of clobbering it.
         _elapsed = time.perf_counter() - _t0
-        self.status_message = f"Ready ({_elapsed:.1f}s)"
+        if not self.status_message.startswith("Error"):
+            self.status_message = f"Ready ({_elapsed:.1f}s)"
 
         # --- Restore state ---
         if state is not None:
@@ -335,6 +376,25 @@ class ShowPDF4D(anywidget.AnyWidget):
                 return bf.astype(np.float32)
         # Fallback: sum polar data over phi and r
         return self._pdf.polar.array.sum(axis=(-2, -1)).astype(np.float32)
+
+    def _resolve_nav_calibration(self) -> tuple[float, str]:
+        """Resolve real-space scan calibration from the input dataset.
+
+        Returns (pixel_size, unit) where unit is "Å" if the dataset's first
+        axis is in Å/A/angstrom/nm (with nm→Å conversion), else "px".
+        """
+        input_data = getattr(self._pdf, "input_data", None)
+        sampling = getattr(input_data, "sampling", None)
+        units = getattr(input_data, "units", None)
+        if sampling is None or units is None or len(units) == 0:
+            return 1.0, "px"
+        unit0 = str(units[0]).lower()
+        size0 = float(sampling[0])
+        if unit0 in ("å", "a", "angstrom", "angstroms"):
+            return size0, "Å"
+        if unit0 == "nm":
+            return size0 * 10.0, "Å"
+        return 1.0, "px"
 
     def _on_mask_change(self, change=None):
         if self._initializing:
@@ -366,10 +426,33 @@ class ShowPDF4D(anywidget.AnyWidget):
             self._pdf.rho0 = None
         self._compute_gr()
 
+    def _on_probe_change(self, change=None):
+        if self._initializing:
+            return
+        # Probe defines a synthetic mask; treat as a mask change and recompute.
+        self._pdf.Ik = None
+        self._pdf.bg = None
+        self._update_mask_stats()
+        self._recompute_full()
+
     # =========================================================================
     # Core computation
     # =========================================================================
     def _get_mask(self):
+        # Probe mode: synthesize a square mask centered at (probe_row, probe_col)
+        # with side 2*probe_size-1 (matching the freeform brush sizing convention).
+        if self.analysis_mode == "probe":
+            half = max(0, int(self.probe_size) - 1)
+            r0 = max(0, int(self.probe_row) - half)
+            r1 = min(self.scan_rows, int(self.probe_row) + half + 1)
+            c0 = max(0, int(self.probe_col) - half)
+            c1 = min(self.scan_cols, int(self.probe_col) + half + 1)
+            if r1 <= r0 or c1 <= c0:
+                return None
+            mask = np.zeros((self.scan_rows, self.scan_cols), dtype=bool)
+            mask[r0:r1, c0:c1] = True
+            return mask
+        # Mask mode: decode painted mask
         if not self.mask_b64:
             return None
         raw = base64.b64decode(self.mask_b64)
@@ -386,21 +469,23 @@ class ShowPDF4D(anywidget.AnyWidget):
 
     def _update_mask_stats(self):
         mask = self._get_mask()
-        if mask is None:
-            total = self.scan_rows * self.scan_cols
-            if not self.mask_b64:
-                self.mask_pixel_count = total
-                self.mask_fraction = 1.0
-            else:
-                raw = base64.b64decode(self.mask_b64)
-                count = int(np.frombuffer(raw, dtype=np.uint8).sum())
-                self.mask_pixel_count = count if count > 0 else total
-                self.mask_fraction = (count / total) if count > 0 else 1.0
-        else:
+        total = self.scan_rows * self.scan_cols
+        if mask is not None:
             count = int(mask.sum())
-            total = self.scan_rows * self.scan_cols
             self.mask_pixel_count = count
             self.mask_fraction = count / total
+        elif self.analysis_mode == "probe":
+            # Probe out of bounds — nothing selected
+            self.mask_pixel_count = 0
+            self.mask_fraction = 0.0
+        elif not self.mask_b64:
+            self.mask_pixel_count = total
+            self.mask_fraction = 1.0
+        else:
+            raw = base64.b64decode(self.mask_b64)
+            count = int(np.frombuffer(raw, dtype=np.uint8).sum())
+            self.mask_pixel_count = count if count > 0 else total
+            self.mask_fraction = (count / total) if count > 0 else 1.0
 
     def _recompute_full(self):
         self.computing = True
@@ -546,11 +631,17 @@ class ShowPDF4D(anywidget.AnyWidget):
                 f"Mask shape {mask_np.shape} does not match scan shape "
                 f"({self.scan_rows}, {self.scan_cols})"
             )
-        self.mask_bytes = mask_np.astype(np.uint8).tobytes()
+        raw = mask_np.astype(np.uint8).tobytes()
+        self.mask_bytes = raw
+        # Mirror to mask_b64 so _get_mask() (analysis read path) sees it.
+        self.mask_b64 = base64.b64encode(raw).decode("ascii")
+        self._on_mask_change()
         return self
 
     def clear_mask(self) -> Self:
         self.mask_bytes = b""
+        self.mask_b64 = ""
+        self._on_mask_change()
         return self
 
     def set_data(self, data, *, nav_image=None, find_origin=True, **pdf_kwargs) -> Self:
@@ -582,6 +673,7 @@ class ShowPDF4D(anywidget.AnyWidget):
         self.nav_data_min = float(nav_img.min())
         self.nav_data_max = float(nav_img.max())
         self.nav_image_bytes = nav_img.tobytes()
+        self.nav_pixel_size, self.nav_unit = self._resolve_nav_calibration()
 
         # Reset mask and recompute
         self.mask_bytes = b""
@@ -610,6 +702,10 @@ class ShowPDF4D(anywidget.AnyWidget):
             "r_cut": self.r_cut,
             "density_mode": self.density_mode,
             "density_value": self.density_value,
+            "analysis_mode": self.analysis_mode,
+            "probe_row": self.probe_row,
+            "probe_col": self.probe_col,
+            "probe_size": self.probe_size,
             "plot_mode": self.plot_mode,
             "show_background": self.show_background,
             "cmap": self.cmap,
@@ -622,7 +718,7 @@ class ShowPDF4D(anywidget.AnyWidget):
         }
 
     def save(self, path: str) -> None:
-        save_state_file(path, "ShowPDF4D", self.state_dict())
+        save_state_file(path, "ShowPDF", self.state_dict())
 
     def load_state_dict(self, state: dict) -> None:
         self._initializing = True
@@ -637,7 +733,7 @@ class ShowPDF4D(anywidget.AnyWidget):
         self._recompute_full()
 
     def summary(self) -> None:
-        name = self.title or "ShowPDF4D"
+        name = self.title or "ShowPDF"
         lines = [name, "═" * 32]
         lines.append(f"Scan:     {self.scan_rows} × {self.scan_cols}")
         lines.append(
@@ -667,6 +763,6 @@ class ShowPDF4D(anywidget.AnyWidget):
             f", mask={self.mask_pixel_count}px" if self.mask_bytes else ""
         )
         return (
-            f"ShowPDF4D(scan=({self.scan_rows}, {self.scan_cols}), "
+            f"ShowPDF(scan=({self.scan_rows}, {self.scan_cols}), "
             f"k=[{self.k_min_fit:.1f}, {self.k_max_fit:.1f}]{mask_info})"
         )

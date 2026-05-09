@@ -62,7 +62,7 @@
       "tool_groups": ["display", "export", "all"],
       "aliases": {}
     },
-    "ShowPDF4D": {
+    "ShowPDF": {
       "tool_groups": ["display", "mask", "parameters", "stats", "export", "all"],
       "aliases": {}
     }

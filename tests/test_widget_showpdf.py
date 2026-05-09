@@ -1,12 +1,13 @@
-"""Unit tests for ShowPDF4D widget."""
+"""Unit tests for ShowPDF widget."""
 
 import json
 
 import numpy as np
 import pytest
 
+from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.diffraction import PairDistributionFunction
-from quantem.widget import ShowPDF4D
+from quantem.widget import ShowPDF
 
 
 @pytest.fixture
@@ -32,8 +33,9 @@ def small_pdf():
         for ix in range(scan_x):
             data[iy, ix] = dp + 0.01 * rng.randn(det_h, det_w).astype(np.float32)
 
+    ds = Dataset4dstem.from_array(data)
     pdf = PairDistributionFunction.from_data(
-        data,
+        ds,
         find_origin=False,
         origin_row=center_r,
         origin_col=center_c,
@@ -44,8 +46,8 @@ def small_pdf():
     return pdf
 
 
-def test_showpdf4d_from_pdf_object(small_pdf):
-    w = ShowPDF4D(small_pdf)
+def test_showpdf_from_pdf_object(small_pdf):
+    w = ShowPDF(small_pdf)
     assert w.scan_rows == 4
     assert w.scan_cols == 4
     assert w.n_points_ik > 0
@@ -61,21 +63,21 @@ def test_showpdf4d_from_pdf_object(small_pdf):
     assert len(w.nav_image_bytes) > 0
 
 
-def test_showpdf4d_state_dict_roundtrip(small_pdf):
-    w1 = ShowPDF4D(small_pdf, k_min_fit=1.5, r_max=15.0, plot_mode="Ik")
+def test_showpdf_state_dict_roundtrip(small_pdf):
+    w1 = ShowPDF(small_pdf, k_min_fit=1.5, r_max=15.0, plot_mode="Ik")
     state = w1.state_dict()
     assert state["k_min_fit"] == 1.5
     assert state["r_max"] == 15.0
     assert state["plot_mode"] == "Ik"
 
     # Restore into a new widget
-    w2 = ShowPDF4D(small_pdf, state=state)
+    w2 = ShowPDF(small_pdf, state=state)
     for key in state:
         assert getattr(w2, key) == state[key], f"Mismatch on {key}"
 
 
-def test_showpdf4d_save_load_file(small_pdf, tmp_path):
-    w = ShowPDF4D(small_pdf, title="Test PDF", r_max=12.0)
+def test_showpdf_save_load_file(small_pdf, tmp_path):
+    w = ShowPDF(small_pdf, title="Test PDF", r_max=12.0)
     path = str(tmp_path / "pdf_state.json")
     w.save(path)
 
@@ -83,20 +85,20 @@ def test_showpdf4d_save_load_file(small_pdf, tmp_path):
     with open(path) as f:
         envelope = json.load(f)
     assert "metadata_version" in envelope
-    assert envelope["widget_name"] == "ShowPDF4D"
+    assert envelope["widget_name"] == "ShowPDF"
     assert "widget_version" in envelope
     assert "state" in envelope
     assert envelope["state"]["title"] == "Test PDF"
     assert envelope["state"]["r_max"] == 12.0
 
     # Load from file path
-    w2 = ShowPDF4D(small_pdf, state=path)
+    w2 = ShowPDF(small_pdf, state=path)
     assert w2.title == "Test PDF"
     assert w2.r_max == 12.0
 
 
-def test_showpdf4d_summary(small_pdf, capsys):
-    w = ShowPDF4D(small_pdf, title="My PDF")
+def test_showpdf_summary(small_pdf, capsys):
+    w = ShowPDF(small_pdf, title="My PDF")
     w.summary()
     captured = capsys.readouterr()
     assert "My PDF" in captured.out
@@ -104,8 +106,8 @@ def test_showpdf4d_summary(small_pdf, capsys):
     assert "Mask:" in captured.out
 
 
-def test_showpdf4d_mask_recompute(small_pdf):
-    w = ShowPDF4D(small_pdf)
+def test_showpdf_mask_recompute(small_pdf):
+    w = ShowPDF(small_pdf)
 
     # Capture initial G(r)
     gr_initial = np.frombuffer(w.gr_y_bytes, dtype=np.float32).copy()
@@ -123,22 +125,20 @@ def test_showpdf4d_mask_recompute(small_pdf):
     assert not np.allclose(gr_initial, gr_masked, atol=1e-10)
 
 
-def test_showpdf4d_parameter_change(small_pdf):
-    w = ShowPDF4D(small_pdf)
+def test_showpdf_parameter_change(small_pdf):
+    w = ShowPDF(small_pdf, r_max=20.0)
+    n_points_gr_initial = w.n_points_gr
 
-    # Capture initial F(k)
-    fk_initial = np.frombuffer(w.fk_y_bytes, dtype=np.float32).copy()
-
-    # Change window range — this should change windowed F(k) and G(r)
+    # Change r_max — should resize the G(r) output grid (r_min..r_max with r_step).
     w.r_max = 10.0
 
-    gr_new = np.frombuffer(w.gr_y_bytes, dtype=np.float32)
-    # Different r_max means different output grid length
-    assert w.n_points_gr != len(fk_initial) or True  # grid changed
+    # Half the r range with the same r_step should yield ~half as many points.
+    assert w.n_points_gr != n_points_gr_initial
+    assert w.n_points_gr == int(round(w.r_max / w.r_step))
 
 
-def test_showpdf4d_clear_mask(small_pdf):
-    w = ShowPDF4D(small_pdf)
+def test_showpdf_clear_mask(small_pdf):
+    w = ShowPDF(small_pdf)
     gr_no_mask = np.frombuffer(w.gr_y_bytes, dtype=np.float32).copy()
 
     # Set then clear mask
@@ -151,8 +151,8 @@ def test_showpdf4d_clear_mask(small_pdf):
     assert np.allclose(gr_no_mask, gr_cleared, atol=1e-6)
 
 
-def test_showpdf4d_set_data(small_pdf):
-    w = ShowPDF4D(small_pdf)
+def test_showpdf_set_data(small_pdf):
+    w = ShowPDF(small_pdf)
     assert w.scan_rows == 4
 
     # Build a different-sized PDF (2x2 scan)
@@ -163,8 +163,9 @@ def test_showpdf4d_set_data(small_pdf):
     dp = np.exp(-(radius**2) / 20).astype(np.float32)
     data2 = np.stack([[dp, dp], [dp, dp]])
 
+    ds2 = Dataset4dstem.from_array(data2)
     pdf2 = PairDistributionFunction.from_data(
-        data2,
+        ds2,
         find_origin=False,
         origin_row=center_r,
         origin_col=center_c,

@@ -321,7 +321,7 @@ def test_showcomplex_default_options():
     assert widget.show_controls is True
     assert widget.show_fft is False
     assert widget.scale_bar_visible is True
-    assert widget.image_width_px == 0
+    assert widget.canvas_size == 0
     assert widget.percentile_low == pytest.approx(1.0)
     assert widget.percentile_high == pytest.approx(99.0)
 
@@ -351,11 +351,11 @@ def test_showcomplex_scale_bar():
     w = ShowComplex2D(data, scale_bar_visible=False)
     assert w.scale_bar_visible is False
 
-def test_showcomplex_image_width_px():
-    """image_width_px option."""
+def test_showcomplex_canvas_size():
+    """canvas_size option."""
     data = (np.random.rand(8, 8) + 1j * np.random.rand(8, 8)).astype(np.complex64)
-    w = ShowComplex2D(data, image_width_px=800)
-    assert w.image_width_px == 800
+    w = ShowComplex2D(data, canvas_size=800)
+    assert w.canvas_size == 800
 
 def test_showcomplex_percentiles():
     """Custom percentile settings."""
@@ -515,9 +515,9 @@ def test_showcomplex_state_dict_completeness():
     state = widget.state_dict()
     expected_keys = {
         "display_mode", "title", "cmap", "log_scale", "auto_contrast",
-        "percentile_low", "percentile_high", "pixel_size",
+        "percentile_low", "percentile_high", "vmin", "vmax", "pixel_size",
         "scale_bar_visible", "show_fft", "fft_window", "show_stats", "show_controls",
-        "image_width_px", "disabled_tools", "hidden_tools",
+        "canvas_size", "disabled_tools", "hidden_tools",
         "roi_mode", "roi_center_row", "roi_center_col",
         "roi_radius", "roi_width", "roi_height",
     }
@@ -540,7 +540,7 @@ def test_showcomplex_state_dict_all_options():
         show_fft=True,
         show_stats=False,
         show_controls=False,
-        image_width_px=600,
+        canvas_size=600,
     )
     state = w1.state_dict()
     w2 = ShowComplex2D(data, state=state)
@@ -556,7 +556,7 @@ def test_showcomplex_state_dict_all_options():
     assert w2.show_fft is True
     assert w2.show_stats is False
     assert w2.show_controls is False
-    assert w2.image_width_px == 600
+    assert w2.canvas_size == 600
 
 def test_showcomplex_save_load_file(tmp_path):
     """State can be saved to and loaded from a JSON file."""
@@ -935,3 +935,70 @@ def test_showcomplex_roi_tool_visibility():
     assert "roi" in w.hidden_tools
     w2 = ShowComplex2D(data, disable_roi=True)
     assert "roi" in w2.disabled_tools
+
+
+# ── vmin/vmax tests ─────────────────────────────────────────────────────
+
+
+def test_showcomplex_vmin_vmax_default_none():
+    data = (np.random.rand(16, 16) + 1j * np.random.rand(16, 16)).astype(np.complex64)
+    w = ShowComplex2D(data)
+    assert w.vmin is None
+    assert w.vmax is None
+
+
+def test_showcomplex_vmin_vmax_constructor():
+    data = (np.random.rand(16, 16) + 1j * np.random.rand(16, 16)).astype(np.complex64)
+    w = ShowComplex2D(data, vmin=0, vmax=100)
+    assert w.vmin == pytest.approx(0)
+    assert w.vmax == pytest.approx(100)
+
+
+def test_showcomplex_vmin_vmax_state_dict_roundtrip():
+    data = (np.random.rand(16, 16) + 1j * np.random.rand(16, 16)).astype(np.complex64)
+    w = ShowComplex2D(data, vmin=0, vmax=100)
+    sd = w.state_dict()
+    assert sd["vmin"] == pytest.approx(0)
+    assert sd["vmax"] == pytest.approx(100)
+    w2 = ShowComplex2D(data, state=sd)
+    assert w2.vmin == pytest.approx(0)
+    assert w2.vmax == pytest.approx(100)
+
+
+def test_showcomplex_vmin_vmax_none_in_state_dict():
+    data = (np.random.rand(16, 16) + 1j * np.random.rand(16, 16)).astype(np.complex64)
+    w = ShowComplex2D(data)
+    sd = w.state_dict()
+    assert sd["vmin"] is None
+    assert sd["vmax"] is None
+
+
+def test_showcomplex_vmin_vmax_normalize_frame():
+    data = (np.random.rand(16, 16) + 1j * np.random.rand(16, 16)).astype(np.complex64)
+    frame = np.array([[0, 50], [100, 150]], dtype=np.float32)
+    w = ShowComplex2D(data, vmin=0, vmax=100)
+    result = w._normalize_frame(frame)
+    assert result[0, 0] == 0
+    assert result[1, 0] == 255
+    assert result[1, 1] == 255  # clamped
+    assert 120 <= result[0, 1] <= 135  # ~127
+
+
+def test_showcomplex_vmin_vmax_summary(capsys):
+    data = (np.random.rand(16, 16) + 1j * np.random.rand(16, 16)).astype(np.complex64)
+    w = ShowComplex2D(data, vmin=0, vmax=100)
+    w.summary()
+    out = capsys.readouterr().out
+    assert "vmin=0" in out
+    assert "vmax=100" in out
+
+
+def test_showcomplex_vmin_vmax_phase_mode_ignores():
+    """Phase mode always uses [-pi, pi], ignoring vmin/vmax."""
+    data = (np.random.rand(16, 16) + 1j * np.random.rand(16, 16)).astype(np.complex64)
+    w = ShowComplex2D(data, vmin=0, vmax=100, display_mode="phase")
+    # save_image in phase mode should still work (uses [-pi, pi])
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".png") as f:
+        path = w.save_image(f.name, display_mode="phase")
+        assert path.exists()

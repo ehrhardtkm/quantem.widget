@@ -17,6 +17,7 @@ import traitlets
 from quantem.widget.array_utils import to_numpy
 from quantem.widget.io import IO, IOResult
 from quantem.widget.json_state import build_json_header, resolve_widget_version, save_state_file, unwrap_state_payload
+from quantem.widget.show2d import _reject_unknown_kwargs
 from quantem.widget.tool_parity import (
     bind_tool_runtime_api,
     build_tool_groups,
@@ -85,6 +86,13 @@ class Show3D(anywidget.AnyWidget):
         Timestamps for each frame (e.g., seconds or dose values).
     timestamp_unit : str, default "s"
         Unit for timestamps (e.g., "s", "ms", "e/A2").
+    size : int, default 0
+        Canvas rendering size in CSS pixels (the on-screen width of the main
+        viewport).  ``0`` uses the frontend default (500 px).  Pass e.g.
+        ``size=800`` to enlarge for a presentation, or ``size=300`` to compress
+        alongside a control panel.  This controls **display only** — the
+        underlying stack resolution is never resampled; scrubbing and zoom
+        still see every pixel of the full-resolution frame.
     disabled_tools : list of str, optional
         Tool groups to lock while still showing controls. Supported:
         ``"display"``, ``"histogram"``, ``"stats"``, ``"playback"``,
@@ -98,6 +106,20 @@ class Show3D(anywidget.AnyWidget):
         ``disabled_tools``.
     hide_* : bool, optional
         Convenience flags mirroring ``disable_*`` for ``hidden_tools``.
+
+    Attributes
+    ----------
+    render_total_ms : int or None
+        End-to-end wall clock from constructor start to first browser paint,
+        populated by a JS→Python round-trip after the first canvas render.
+        ``None`` until the browser has actually painted; also printed to stdout
+        when it fires.  Use to triage "is it Python, wire, or the browser?"
+        during live acquisitions.
+    render_python_build_ms : int or None
+        Subset of ``render_total_ms`` covering Python ``__init__`` only.
+    render_wire_js_ms : int or None
+        Subset covering everything after Python returns: Comm transfer, JS
+        decode, colormap, and canvas paint.
 
     Examples
     --------
@@ -122,11 +144,18 @@ class Show3D(anywidget.AnyWidget):
     # =========================================================================
     # Core State
     # =========================================================================
+    # GPU memory budget for display buffers (same as Show2D)
+    _GPU_DISPLAY_BUDGET_MB = 2500
+
     slice_idx = traitlets.Int(0).tag(sync=True)
     n_slices = traitlets.Int(1).tag(sync=True)
     height = traitlets.Int(1).tag(sync=True)
     width = traitlets.Int(1).tag(sync=True)
     frame_bytes = traitlets.Bytes(b"").tag(sync=True)
+    _display_bin_factor = traitlets.Int(1).tag(sync=True)
+    # Flipped True by JS after the first colormap pass has painted to canvas.
+    # Drives the truthful timing print (end-to-end, not __init__-only).
+    _js_rendered = traitlets.Bool(False).tag(sync=True)
     labels = traitlets.List(traitlets.Unicode()).tag(sync=True)
     title = traitlets.Unicode("").tag(sync=True)
     cmap = traitlets.Unicode("magma").tag(sync=True)
@@ -166,6 +195,8 @@ class Show3D(anywidget.AnyWidget):
     auto_contrast = traitlets.Bool(False).tag(sync=True)
     percentile_low = traitlets.Float(1.0).tag(sync=True)
     percentile_high = traitlets.Float(99.0).tag(sync=True)
+    vmin = traitlets.Float(None, allow_none=True).tag(sync=True)
+    vmax = traitlets.Float(None, allow_none=True).tag(sync=True)
     data_min = traitlets.Float(0.0).tag(sync=True)
     data_max = traitlets.Float(0.0).tag(sync=True)
 
@@ -193,7 +224,7 @@ class Show3D(anywidget.AnyWidget):
     # =========================================================================
     # Sizing
     # =========================================================================
-    canvas_size = traitlets.Int(0).tag(sync=True)  # If 0, use frontend defaults
+    size = traitlets.Int(0).tag(sync=True)  # Canvas rendering size in CSS pixels; 0 = frontend default
 
     # =========================================================================
     # Diff Mode
@@ -340,7 +371,7 @@ class Show3D(anywidget.AnyWidget):
         show_playback: bool = False,
         show_stats: bool = True,
         show_controls: bool = True,
-        canvas_size: int = 0,
+        size: int = 0,
         disabled_tools: list[str] | None = None,
         disable_display: bool = False,
         disable_histogram: bool = False,
@@ -368,10 +399,57 @@ class Show3D(anywidget.AnyWidget):
         dim_label: str = "Frame",
         use_torch: bool = False,
         device: str | None = None,
+        display_bin: int | str = "auto",
         state=None,
         **kwargs,
     ):
+        import time as _time
+        _t0 = _time.perf_counter()
+        # Reject unknown kwargs so typos raise instead of being silently ignored.
+        _reject_unknown_kwargs(type(self), kwargs)
         super().__init__(**kwargs)
+        # hold_sync() batches ALL traitlet assignments into a single comm message
+        # sent when the context manager exits.  Without this, each self.x = y
+        # fires a separate round-trip over the ZMQ/websocket channel, which
+        # can add 30+ seconds for a large stack in VS Code Jupyter.
+        with self.hold_sync():
+            self._init_sync(data_args, labels=labels, panel_titles=panel_titles,
+                            title=title, cmap=cmap, vmin=vmin, vmax=vmax,
+                            pixel_size=pixel_size, log_scale=log_scale,
+                            auto_contrast=auto_contrast, percentile_low=percentile_low,
+                            percentile_high=percentile_high, fps=fps, timestamps=timestamps,
+                            timestamp_unit=timestamp_unit, show_fft=show_fft,
+                            fft_window=fft_window, show_playback=show_playback,
+                            show_stats=show_stats, show_controls=show_controls,
+                            size=size, disabled_tools=disabled_tools,
+                            disable_display=disable_display,
+                            disable_histogram=disable_histogram,
+                            disable_stats=disable_stats, disable_playback=disable_playback,
+                            disable_navigation=disable_navigation,
+                            disable_view=disable_view, disable_export=disable_export,
+                            disable_roi=disable_roi, disable_profile=disable_profile,
+                            disable_all=disable_all, hidden_tools=hidden_tools,
+                            hide_display=hide_display, hide_histogram=hide_histogram,
+                            hide_stats=hide_stats, hide_playback=hide_playback,
+                            hide_navigation=hide_navigation, hide_view=hide_view,
+                            hide_export=hide_export, hide_roi=hide_roi,
+                            hide_profile=hide_profile, hide_all=hide_all,
+                            diff_mode=diff_mode, buffer_size=buffer_size,
+                            dim_label=dim_label, use_torch=use_torch, device=device,
+                            display_bin=display_bin, state=state, _t0=_t0)
+
+    def _init_sync(self, data_args, *, labels, panel_titles, title, cmap, vmin, vmax,
+                   pixel_size, log_scale, auto_contrast, percentile_low, percentile_high,
+                   fps, timestamps, timestamp_unit, show_fft, fft_window, show_playback,
+                   show_stats, show_controls, size, disabled_tools,
+                   disable_display, disable_histogram, disable_stats, disable_playback,
+                   disable_navigation, disable_view, disable_export, disable_roi,
+                   disable_profile, disable_all, hidden_tools, hide_display,
+                   hide_histogram, hide_stats, hide_playback, hide_navigation,
+                   hide_view, hide_export, hide_roi, hide_profile, hide_all,
+                   diff_mode, buffer_size, dim_label, use_torch, device, display_bin,
+                   state, _t0):
+        import time as _time
         self.widget_version = resolve_widget_version()
 
         # Optional torch GPU acceleration
@@ -466,16 +544,60 @@ class Show3D(anywidget.AnyWidget):
                 self.panel_titles = list(panel_titles)
             else:
                 self.panel_titles = [f"Panel {i+1}" for i in range(len(panels))]
-            # Normalize each panel independently to [0, 1] so they share
-            # the same contrast range in the viewer
-            normalized = []
-            for p in panels:
-                p2, p98 = np.percentile(p, [2, 98])
-                rng = p98 - p2
-                if rng < 1e-10:
-                    rng = 1.0
-                normalized.append(np.clip((p - p2) / rng, 0, 1).astype(np.float32))
-            # Concatenate horizontally with 2px black separator (matches canvas bg)
+            # Bin each panel FIRST (before normalize), then normalize the
+            # small binned data, then concatenate. Order matters for 4K:
+            #   Old: normalize 768MB×3 (4.8s) → concat 2.3GB → bin (2.3s) = 7.1s
+            #   New: bin 768MB×3 (1.8s) → normalize 48MB×3 (0.1s) → concat = 1.9s
+            from quantem.widget.array_utils import bin2d as _bin2d
+            orig_h = panels[0].shape[1]
+            frame_mb = orig_h * panels[0].shape[2] * 4 / (1024 * 1024)
+            # Compute per-panel bin factor (same auto-bin logic as single panel)
+            panel_bin = 1
+            total_w = sum(p.shape[2] for p in panels) + 2 * (len(panels) - 1)
+            combined_frame_mb = orig_h * total_w * 4 / (1024 * 1024)
+            if combined_frame_mb > 32:
+                for bf in [2, 4, 8]:
+                    if combined_frame_mb / (bf * bf) <= 32:
+                        panel_bin = bf
+                        break
+                else:
+                    panel_bin = 8
+
+            if panel_bin > 1:
+                # Bin each panel with direct reshape+mean (no copy overhead)
+                binned_panels = []
+                for p in panels:
+                    n_f, h_f, w_f = p.shape
+                    oh = h_f // panel_bin * panel_bin
+                    ow = w_f // panel_bin * panel_bin
+                    binned_panels.append(
+                        p[:, :oh, :ow]
+                        .reshape(n_f, oh // panel_bin, panel_bin, ow // panel_bin, panel_bin)
+                        .mean(axis=(2, 4)).astype(np.float32)
+                    )
+                # Normalize the SMALL binned data
+                normalized = []
+                for bp in binned_panels:
+                    if bp.size > 10_000_000:
+                        sample = bp.flat[::max(1, bp.size // 1_000_000)]
+                        p2, p98 = np.percentile(sample, [2, 98])
+                    else:
+                        p2, p98 = np.percentile(bp, [2, 98])
+                    rng = max(p98 - p2, 1e-10)
+                    normalized.append(np.clip((bp - p2) / rng, 0, 1).astype(np.float32))
+            else:
+                # No binning needed — normalize at full res
+                normalized = []
+                for p in panels:
+                    if p.size > 10_000_000:
+                        sample = p.flat[::max(1, p.size // 1_000_000)]
+                        p2, p98 = np.percentile(sample, [2, 98])
+                    else:
+                        p2, p98 = np.percentile(p, [2, 98])
+                    rng = max(p98 - p2, 1e-10)
+                    normalized.append(np.clip((p - p2) / rng, 0, 1).astype(np.float32))
+
+            # Concatenate horizontally with 2px black separator
             sep_w = 2
             sep = np.zeros(
                 (normalized[0].shape[0], normalized[0].shape[1], sep_w),
@@ -487,9 +609,12 @@ class Show3D(anywidget.AnyWidget):
                     parts.append(sep)
                 parts.append(p)
             data = np.concatenate(parts, axis=2)
-            self._panel_width = panels[0].shape[2]
+            self._panel_width = panels[0].shape[2] // max(panel_bin, 1)
+            # Multi-panel already binned — skip auto-bin below
+            self._multi_panel_bin = panel_bin
         else:
             self.n_panels = 1
+            self._multi_panel_bin = 0
             if panel_titles is not None:
                 self.panel_titles = list(panel_titles)
 
@@ -502,8 +627,50 @@ class Show3D(anywidget.AnyWidget):
 
         # Dimensions
         self.n_slices = int(self._data.shape[0])
-        self.height = int(self._data.shape[1])
-        self.width = int(self._data.shape[2])
+        orig_h = int(self._data.shape[1])
+        orig_w = int(self._data.shape[2])
+
+        # Auto-bin for display: reduce per-frame size to speed up trait sync.
+        # Multi-panel data is already binned in the multi-panel path above.
+        self._display_bin = 1
+        if self._multi_panel_bin > 0:
+            # Multi-panel already binned — _data IS the display data
+            self._display_bin = self._multi_panel_bin
+        elif display_bin == "auto":
+            frame_mb = orig_h * orig_w * 4 / (1024 * 1024)
+            if frame_mb > 32:
+                for bf in [2, 4, 8]:
+                    if frame_mb / (bf * bf) <= 32:
+                        self._display_bin = bf
+                        break
+                else:
+                    self._display_bin = 8
+        elif isinstance(display_bin, int) and display_bin > 1:
+            self._display_bin = display_bin
+
+        if self._multi_panel_bin > 0:
+            # Multi-panel already binned — _data IS the display data
+            self._display_data = self._data
+            self.height = orig_h
+            self.width = orig_w
+            self._display_bin_factor = self._multi_panel_bin
+            if pixel_size > 0:
+                pixel_size = pixel_size * self._multi_panel_bin
+            print(f"  Display bin {self._multi_panel_bin}× (multi-panel): {self.height}×{self.width} ({self._display_data[0].nbytes // 1024 // 1024} MB/frame)")
+        elif self._display_bin > 1:
+            from quantem.widget.array_utils import bin2d
+            self._display_data = bin2d(self._data, factor=self._display_bin, mode="mean")
+            self.height = int(self._display_data.shape[1])
+            self.width = int(self._display_data.shape[2])
+            self._display_bin_factor = self._display_bin
+            if pixel_size > 0:
+                pixel_size = pixel_size * self._display_bin
+            print(f"  Display bin {self._display_bin}×: {orig_h}×{orig_w} → {self.height}×{self.width} ({self._display_data[0].nbytes // 1024 // 1024} MB/frame)")
+        else:
+            self._display_data = self._data
+            self.height = orig_h
+            self.width = orig_w
+            self._display_bin_factor = 1
 
         # Color range (global across all frames)
         self._vmin_user = vmin
@@ -539,6 +706,8 @@ class Show3D(anywidget.AnyWidget):
         self.auto_contrast = auto_contrast
         self.percentile_low = percentile_low
         self.percentile_high = percentile_high
+        self.vmin = vmin
+        self.vmax = vmax
         self.fps = fps
 
         # Timestamps
@@ -554,7 +723,7 @@ class Show3D(anywidget.AnyWidget):
         self.show_playback = show_playback
         self.show_stats = show_stats
         self.show_controls = show_controls
-        self.canvas_size = canvas_size
+        self.size = size
         self.disabled_tools = self._build_disabled_tools(
             disabled_tools=disabled_tools,
             disable_display=disable_display,
@@ -616,6 +785,36 @@ class Show3D(anywidget.AnyWidget):
                 state = unwrap_state_payload(state)
             self.load_state_dict(state)
 
+        # Stash wall-clock start on the instance; observer below prints the
+        # TRUE end-to-end time after JS signals first paint.  The Python-only
+        # __init__ number is misleading for widget UX.
+        self._init_t0 = _t0
+        self._init_py_elapsed_ms = (_time.perf_counter() - _t0) * 1000
+        self.observe(self._on_first_render, names=["_js_rendered"])
+
+    def _on_first_render(self, change):
+        import time as _time
+        if not change.get("new"):
+            return
+        total_ms = (_time.perf_counter() - self._init_t0) * 1000
+        py_ms = self._init_py_elapsed_ms
+        shape = f"{self.n_slices}×{self.height}×{self.width}"
+        mem = self._data.nbytes
+        mem_str = f"{mem / (1 << 20):.0f} MB" if mem >= 1 << 20 else f"{mem / (1 << 10):.0f} KB"
+        self.render_total_ms = int(total_ms)
+        self.render_python_build_ms = int(py_ms)
+        self.render_wire_js_ms = int(total_ms - py_ms)
+        print(
+            f"Show3D: {shape} {mem_str} — "
+            f"rendered in {total_ms:.0f} ms (Python build {py_ms:.0f} ms, "
+            f"wire+JS {total_ms - py_ms:.0f} ms)",
+            flush=True,
+        )
+        try:
+            self.unobserve(self._on_first_render, names=["_js_rendered"])
+        except Exception:
+            pass
+
     def set_image(self, data, labels=None):
         """Replace the stack data. Preserves all display settings."""
         if hasattr(data, "array") and hasattr(data, "name") and hasattr(data, "sampling"):
@@ -627,8 +826,31 @@ class Show3D(anywidget.AnyWidget):
         if self._use_torch:
             self._data_torch = torch.from_numpy(self._data).to(self._device)
         self.n_slices = int(data.shape[0])
-        self.height = int(data.shape[1])
-        self.width = int(data.shape[2])
+
+        # Auto-bin display data
+        orig_h, orig_w = data.shape[1], data.shape[2]
+        frame_mb = orig_h * orig_w * 4 / (1024 * 1024)
+        self._display_bin = 1
+        if frame_mb > 32:
+            for bf in [2, 4, 8]:
+                if frame_mb / (bf * bf) <= 32:
+                    self._display_bin = bf
+                    break
+            else:
+                self._display_bin = 8
+
+        if self._display_bin > 1:
+            from quantem.widget.array_utils import bin2d
+            self._display_data = bin2d(self._data, factor=self._display_bin, mode="mean")
+            self.height = int(self._display_data.shape[1])
+            self.width = int(self._display_data.shape[2])
+            self._display_bin_factor = self._display_bin
+        else:
+            self._display_data = self._data
+            self.height = orig_h
+            self.width = orig_w
+            self._display_bin_factor = 1
+
         if self._use_torch:
             self.data_min = float(self._data_torch.min().item())
             self.data_max = float(self._data_torch.max().item())
@@ -660,6 +882,8 @@ class Show3D(anywidget.AnyWidget):
             "auto_contrast": self.auto_contrast,
             "percentile_low": self.percentile_low,
             "percentile_high": self.percentile_high,
+            "vmin": self.vmin,
+            "vmax": self.vmax,
             "show_stats": self.show_stats,
             "show_controls": self.show_controls,
             "show_fft": self.show_fft,
@@ -669,7 +893,7 @@ class Show3D(anywidget.AnyWidget):
             "hidden_tools": self.hidden_tools,
             "pixel_size": self.pixel_size,
             "scale_bar_visible": self.scale_bar_visible,
-            "canvas_size": self.canvas_size,
+            "size": self.size,
             "fps": self.fps,
             "loop": self.loop,
             "reverse": self.reverse,
@@ -686,6 +910,7 @@ class Show3D(anywidget.AnyWidget):
             "diff_mode": self.diff_mode,
             "dim_label": self.dim_label,
             "timestamp_unit": self.timestamp_unit,
+            "display_bin": self._display_bin,
         }
 
     def save(self, path: str):
@@ -693,6 +918,12 @@ class Show3D(anywidget.AnyWidget):
 
     def load_state_dict(self, state):
         for key, val in state.items():
+            # Silent migration for renamed keys in older saved state files.
+            if key == "canvas_size":
+                key = "size"
+            if key == "display_bin":
+                self._display_bin = val
+                continue
             if hasattr(self, key):
                 setattr(self, key, val)
 
@@ -713,7 +944,12 @@ class Show3D(anywidget.AnyWidget):
             lines.append(f"Data:     min={float(arr.min()):.4g}  max={float(arr.max()):.4g}  mean={float(arr.mean()):.4g}")
         cmap = self.cmap
         scale = "log" if self.log_scale else "linear"
-        contrast = "auto contrast" if self.auto_contrast else "manual contrast"
+        if self.vmin is not None and self.vmax is not None:
+            contrast = f"vmin={self.vmin:.4g}, vmax={self.vmax:.4g}"
+        elif self.auto_contrast:
+            contrast = "auto contrast"
+        else:
+            contrast = "manual contrast"
         display = f"{cmap} | {contrast} | {scale}"
         if self.show_fft:
             display += " | FFT"
@@ -735,11 +971,24 @@ class Show3D(anywidget.AnyWidget):
         if len(self.profile_line) >= 2:
             p0, p1 = self.profile_line[0], self.profile_line[1]
             lines.append(f"Profile:  ({p0['row']:.0f}, {p0['col']:.0f}) → ({p1['row']:.0f}, {p1['col']:.0f}) width={self.profile_width}")
+        rt = getattr(self, "render_total_ms", None)
+        if rt is not None:
+            pb = getattr(self, "render_python_build_ms", 0)
+            wj = getattr(self, "render_wire_js_ms", 0)
+            lines.append(f"Rendered: {rt} ms total (Python build {pb} ms, wire+JS {wj} ms)")
+        else:
+            lines.append("Rendered: (pending first browser paint)")
         print("\n".join(lines))
 
     def _get_color_range(self, frame: np.ndarray) -> tuple[float, float]:
         """Get vmin/vmax based on current settings."""
-        if self.auto_contrast:
+        if self.vmin is not None and self.vmax is not None:
+            vmin = float(self.vmin)
+            vmax = float(self.vmax)
+            if self.log_scale:
+                vmin = float(np.log1p(max(vmin, 0)))
+                vmax = float(np.log1p(max(vmax, 0)))
+        elif self.auto_contrast:
             vmin = float(np.percentile(frame, self.percentile_low))
             vmax = float(np.percentile(frame, self.percentile_high))
         else:
@@ -763,34 +1012,40 @@ class Show3D(anywidget.AnyWidget):
     def _get_display_frame(self, idx=None):
         if idx is None:
             idx = self.slice_idx
-        frame = self._data[idx]
+        data = self._display_data
+        frame = data[idx]
         if self.diff_mode == "previous":
             if idx == 0:
                 return np.zeros_like(frame)
-            return frame - self._data[idx - 1]
+            return frame - data[idx - 1]
         if self.diff_mode == "first":
-            return frame - self._data[0]
+            return frame - data[0]
         return frame
 
     def _on_diff_mode_change(self, change=None):
+        data = self._display_data
         if self.diff_mode == "off":
-            self.data_min = float(self._data.min())
-            self.data_max = float(self._data.max())
+            self.data_min = float(data.min())
+            self.data_max = float(data.max())
+        elif self.diff_mode == "previous":
+            # Vectorized diff: data[1:] - data[:-1]
+            diffs = data[1:] - data[:-1]
+            self.data_min = min(0.0, float(diffs.min()))
+            self.data_max = float(diffs.max())
+        elif self.diff_mode == "first":
+            diffs = data[1:] - data[0:1]
+            self.data_min = min(0.0, float(diffs.min()))
+            self.data_max = float(diffs.max())
         else:
-            # Recompute global range for diff frames
-            mins, maxs = [], []
-            for i in range(self.n_slices):
-                f = self._get_display_frame(i)
-                mins.append(float(f.min()))
-                maxs.append(float(f.max()))
-            self.data_min = min(mins)
-            self.data_max = max(maxs)
+            self.data_min = float(data.min())
+            self.data_max = float(data.max())
         self._update_all()
 
     def _update_all(self):
         """Update frame, stats, and all derived data. Uses hold_sync for batched transfer."""
-        frame = self._get_display_frame()
+        display_frame = self._get_display_frame()
         with self.hold_sync():
+            # Stats from full-res data (not binned display)
             if self._use_torch:
                 t = self._data_torch[self.slice_idx]
                 self.stats_mean = float(t.mean().item())
@@ -798,17 +1053,18 @@ class Show3D(anywidget.AnyWidget):
                 self.stats_max = float(t.max().item())
                 self.stats_std = float(t.std().item())
             else:
-                self.stats_mean = float(frame.mean())
-                self.stats_min = float(frame.min())
-                self.stats_max = float(frame.max())
-                self.stats_std = float(frame.std())
+                full_frame = self._data[self.slice_idx]
+                self.stats_mean = float(full_frame.mean())
+                self.stats_min = float(full_frame.min())
+                self.stats_max = float(full_frame.max())
+                self.stats_std = float(full_frame.std())
             if self.timestamps and self.slice_idx < len(self.timestamps):
                 self.current_timestamp = self.timestamps[self.slice_idx]
             if self.roi_active:
-                self._update_roi_stats(frame)
+                self._update_roi_stats(display_frame)
             else:
                 self.roi_stats = {}
-            self.frame_bytes = frame.tobytes()
+            self.frame_bytes = display_frame.tobytes()
 
     def _roi_mask(self, roi: dict):
         r, c = np.ogrid[0 : self.height, 0 : self.width]
@@ -865,11 +1121,12 @@ class Show3D(anywidget.AnyWidget):
     def _send_buffer(self, start_idx: int):
         end_idx = start_idx + self._buffer_size
         if self.diff_mode == "off":
+            data = self._display_data
             if end_idx <= self.n_slices:
-                chunk = self._data[start_idx:end_idx]
+                chunk = data[start_idx:end_idx]
             else:
                 chunk = np.concatenate(
-                    [self._data[start_idx:], self._data[: end_idx - self.n_slices]]
+                    [data[start_idx:], data[: end_idx - self.n_slices]]
                 )
         else:
             frames = []
@@ -899,16 +1156,22 @@ class Show3D(anywidget.AnyWidget):
         self._update_all()
 
     def _on_roi_change(self, change=None):
-        """Handle ROI change."""
+        """Handle ROI change. Stats for current frame are instant.
+        Full-stack ROI plot is debounced (500ms) to avoid UI freeze during drag."""
         if self.roi_active:
             self._update_roi_stats(self._get_display_frame())
-            self._compute_roi_plot()
+            # Debounce the expensive all-frame ROI plot
+            if hasattr(self, '_roi_plot_timer') and self._roi_plot_timer is not None:
+                self._roi_plot_timer.cancel()
+            import threading
+            self._roi_plot_timer = threading.Timer(0.5, self._compute_roi_plot)
+            self._roi_plot_timer.start()
         else:
             self.roi_stats = {}
             self.roi_plot_data = b""
 
     def _compute_roi_plot(self):
-        """Compute selected ROI mean for all frames."""
+        """Compute selected ROI mean for all frames. Uses display data (binned) for speed."""
         idx = self.roi_selected_idx
         if idx < 0 or idx >= len(self.roi_list):
             self.roi_plot_data = b""
@@ -917,13 +1180,15 @@ class Show3D(anywidget.AnyWidget):
         if mask.sum() == 0:
             self.roi_plot_data = b""
             return
+        # Use _display_data (binned) — 4-16× less data than _data, same ROI result
+        data = self._display_data
         if self._use_torch:
             mask_t = torch.from_numpy(mask).to(self._device)
-            # Vectorized: (n_slices, n_masked_pixels) -> mean per frame
-            masked = self._data_torch[:, mask_t]
+            t = torch.from_numpy(data).to(self._device) if not hasattr(self, '_display_torch') else self._display_torch
+            masked = t[:, mask_t]
             means = masked.mean(dim=1).cpu().numpy().astype(np.float32)
         else:
-            means = np.array([float(self._data[i][mask].mean()) for i in range(self.n_slices)], dtype=np.float32)
+            means = np.array([float(data[i][mask].mean()) for i in range(self.n_slices)], dtype=np.float32)
         self.roi_plot_data = means.tobytes()
 
     # =========================================================================
@@ -1467,6 +1732,9 @@ class Show3D(anywidget.AnyWidget):
         rgba = (cmap_fn(normalized / 255.0) * 255).astype(np.uint8)
 
         img = Image.fromarray(rgba)
+        if fmt == "pdf":
+            Image.init()
+            img = img.convert("RGB")
         path.parent.mkdir(parents=True, exist_ok=True)
         img.save(str(path), dpi=(dpi, dpi))
         return path

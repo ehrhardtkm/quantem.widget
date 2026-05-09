@@ -90,7 +90,7 @@ Use the kernel matching your development conda env for notebooks.
 - No unused variables or imports. Run `npm run typecheck` for JS/TS.
 - **Never skip tests for missing dependencies that are in `pyproject.toml`.** If `h5py`, `hdf5plugin`, `torch`, or any hard dependency is missing, the install is broken — tests must fail loudly, not skip silently. Use `pytest.skip` only for truly optional features (e.g., CuPy on machines without NVIDIA GPUs).
 - **Real arina test fixture:** `tests/data/arina_fixture/` contains a binned real arina dataset (16 frames, 24×24 detector, bitshuffle+LZ4). Tests using this fixture must not be skipped — the data is committed to the repo.
-- **Visual screenshot verification is mandatory for all JS/UI changes.** Do not rely on Python unit tests for widget UI correctness — they only test Python-side logic, not rendering. After running smoke tests, always read and visually inspect the screenshots in `tests/screenshots/smoke/`. This is the ground truth for UI correctness.
+- **Visual screenshot verification is mandatory for all JS/UI changes.** Do not rely on Python unit tests or passing pytest — they only test Python-side logic, not rendering. Passing tests does NOT mean the UI is correct. After running smoke tests, you MUST use the Read tool to open and visually inspect EVERY screenshot in `tests/screenshots/smoke/` for the modified widget. Check for: black/blank panels, missing images, wrong colormaps, broken overlays, corrupted FFT. This is the ground truth for UI correctness. If you skip this step and the user finds a visual bug, it means you failed to do your job.
 - After modifying any widget UI (JS/TS):
   - Always build first: `npm run build`.
   - Run smoke tests **only for the modified widget** using `-k`: `python -m pytest tests/test_e2e_smoke.py -v -k show2d` (filters to that widget's tests — rendering, interactions, and dark theme). No need to run all 69 tests for every change.
@@ -101,11 +101,78 @@ Use the kernel matching your development conda env for notebooks.
 - **JS computation validation:** When implementing mathematical operations in JavaScript (FFT, windowing, statistics, coordinate transforms), always port the exact JS code to Python and validate against NumPy/SciPy/PyTorch ground truth in unit tests. Do not hardcode formulas separately — port the JS line-by-line so the test catches any JS-side bugs. See `test_widget_show2d.py` `_js_hann_1d` / `_js_apply_hann_window_2d` for the pattern.
 - **IO testing must use real data.** When testing IO features (progress bars, benchmark, loading), write notebooks that load real files already on disk — never generate synthetic data with for-loops and tempfiles. Use paths from existing IO notebooks (`notebooks/io/io_file.ipynb`, `io_folder.ipynb`) as reference for where data lives. Supported formats: EMD (Velox), DM3/DM4, TIFF, Arina 4D-STEM (see `notebooks/io/io_arina_file.ipynb` and `io_arina_folder.ipynb`). Unit tests (`tests/test_io.py`) may use synthetic data for CI portability, but notebooks must always use real files.
 
+## Widget Construction Perf — Do Not Do Heavy Work in `_repr_mimebundle_`
+
+`_repr_mimebundle_` is called by Jupyter AFTER `__init__` returns to get the widget's display payload. It runs on the same kernel tick as the cell, and anything it does **blocks the comm flush** — the browser cannot start receiving the widget until this method returns. A past session had `Show2D._repr_mimebundle_` running `matplotlib.pyplot.subplots` + `imshow` + `savefig` over all gallery images (to build a static PNG fallback for nbsphinx), which cost ~1.7 s on every display of a 30-image gallery and made a `Show2D(phases)` cell feel like it took 20 seconds. The PNG was silently dropped in live Jupyter because the widget-view MIME type takes priority.
+
+**Rules for any widget's `_repr_mimebundle_`:**
+- Never call matplotlib, PIL, or any synchronous image rendering unless the caller explicitly opts in (env var or kwarg).
+- The static PNG fallback is for nbsphinx / GitHub / nbviewer only. Gate it behind `QUANTEM_WIDGET_STATIC_FALLBACK=1`.
+- Treat the method as a hot path: microbenchmark with `time.perf_counter()` around it on every new widget, same way you benchmark `__init__`.
+
+**Rule for observers on init-assigned traits:** If `__init__` assigns a trait like `self.image_rotations = [0] * n` that has an `@observe` hook, the hook fires and runs its work a SECOND time after `__init__` body completes. Always add an early-return fast-path to such observers for the no-op case (e.g. all-zeros). Otherwise every widget construction pays 2× the stats+tobytes work for nothing.
+
+**Diagnosis checklist when any widget "feels slow":**
+```python
+import time, anywidget
+from quantem.widget import Show2D  # or whichever widget
+
+_init = anywidget.AnyWidget.__init__
+_repr = Show2D._repr_mimebundle_
+anywidget.AnyWidget.__init__ = lambda self, **kw: (lambda t: (_init(self, **kw), print(f"__init__: {1000*(time.perf_counter()-t):.1f}ms"))[0])(time.perf_counter())
+Show2D._repr_mimebundle_ = lambda self, **kw: (lambda t: (_repr(self, **kw), print(f"_repr_mimebundle_: {1000*(time.perf_counter()-t):.1f}ms"))[0])(time.perf_counter())
+```
+Anything over 100 ms in `_repr_mimebundle_` is a bug. The fix lives there, not in comm/transport.
+
+## Performance Targets
+
+All interactions must be profiled on real 4K EMD data. See `docs/dev/gpu-optimization.md` for the full interaction audit and methodology.
+
+**Show2D (12×4K gallery) — MacBook M5:**
+
+| Interaction | Target | Current | Path |
+|------------|--------|---------|------|
+| Colormap change | <16ms | 7ms | Zero-copy GPU |
+| Log scale toggle | <16ms | 4ms | GPU shader |
+| Auto-contrast (cached) | <16ms | 4ms | GPU histogram cached |
+| Histogram slider drag | <16ms | 7ms | Direct rAF, bypass React |
+| Auto-contrast ON (first) | <500ms | 285ms | GPU histogram batch |
+| FFT toggle (12 imgs) | <10s | 5.7s | Progressive batch-4 |
+
+**Show3D (12×4K stack) — MacBook M5:**
+
+| Interaction | Target | Current | Path |
+|------------|--------|---------|------|
+| Colormap change | <16ms | 5ms | Zero-copy GPU |
+| Frame scrub (2K binned) | <33ms | 20ms | 15ms trait + 5ms GPU |
+| Frame scrub (4K no-bin) | <66ms | 60ms | 33ms trait + 5ms GPU |
+| 3-panel frame scrub | <16ms | 3ms | Auto-bin 4× |
+
+**Known slow paths (need optimization):**
+- Show3D `_compute_roi_plot`: debounced 500ms (was every mousemove, 2s for 48×4K)
+- Show3D diff mode: recomputes ALL frames (1s for 48×4K)
+- FFT on 48 images: ~23s (batch-4 progressive)
+- GIF/ZIP export: Python CPU rendering
+
+**Next GPU target: Show3DVolume (#91)**
+- 3 orthogonal slice panels (XY, XZ, YZ), each re-renders on every slice scrub
+- Users scrub rapidly through volume — 3× colormap work per interaction
+- Same zero-copy pattern (OffscreenCanvas → ImageBitmap) would make all 3 slices instant
+- Volume data is typically 256³ to 512³ (manageable) but can be 1024³+ (needs auto-bin)
+
+**Widgets that do NOT need GPU colormap:**
+- Show4DSTEM: detector frames are 128×128 to 512×512 — CPU colormap is <1ms, GPU overhead would be slower
+- Show4D: signal panels are typically small (256×256 to 512×512)
+- Edit2D, Align2D: single image, small data
+- Only apply GPU colormap to widgets handling 2K+ pixel images
+
+When adding new features, profile the interaction and add it to the audit table. Anything over 100ms needs a GPU path or lazy computation.
+
 ## Shared Modules
 
 - **`js/theme.ts`** — Shared theme detection and color system. Exports `detectTheme()`, `useTheme()` hook, `ThemeColors` type, `DARK_COLORS`/`LIGHT_COLORS`. Used by all widgets for automatic light/dark theme support.
-- **`js/webgpu-fft.ts`** — Shared FFT module used by all FFT-capable widgets (Show2D, Show3D, Show3DVolume, Show4D, Show4DSTEM, ShowComplex2D, Align2D). Provides `WebGPUFFT` class (GPU-accelerated), `fft2d` (CPU fallback, synchronous), `fft2dAsync` (CPU fallback in Web Worker — non-blocking), `fftshift`, `computeMagnitude` (complex→magnitude), `autoEnhanceFFT` (DC mask + 99.9% percentile), `getWebGPUFFT` (singleton), `getGPUInfo`. **Do not debounce FFT recomputation** — use the **rAF generation counter** pattern instead: each FFT trigger increments a generation counter and yields via `requestAnimationFrame` before computing. After the yield, stale generations are discarded. This coalesces rapid drag events to ≤1 FFT per display frame without artificial delay. For the CPU fallback path, use `fft2dAsync` (Web Worker) so the main thread is never blocked. See Show2D's FFT effect for the reference implementation.
-- **`js/colormaps.ts`** — Shared colormap LUTs and rendering. Exports `COLORMAPS`, `COLORMAP_NAMES`, `applyColormap` (float data → RGBA via LUT), `renderToOffscreen` (creates colormapped offscreen canvas).
+- **`js/webgpu-fft.ts`** — Shared FFT module used by all FFT-capable widgets (Show2D, Show3D, Show3DVolume, Show4D, Show4DSTEM, ShowComplex2D, Align2D). Provides `WebGPUFFT` class (GPU-accelerated) with `fft2D` (single image) and `fft2DBatch` (N images with pipelined GPU submissions + batched readback), `fft2d` (CPU fallback, synchronous), `fft2dAsync` (CPU fallback in Web Worker — non-blocking), `fftshift`, `computeMagnitude` (complex→magnitude), `autoEnhanceFFT` (DC mask + 99.9% percentile), `getWebGPUFFT` (singleton), `getGPUInfo`. **Do not debounce FFT recomputation** — use the **rAF generation counter** pattern instead: each FFT trigger increments a generation counter and yields via `requestAnimationFrame` before computing. After the yield, stale generations are discarded. This coalesces rapid drag events to ≤1 FFT per display frame without artificial delay. For the CPU fallback path, use `fft2dAsync` (Web Worker) so the main thread is never blocked. See Show2D's FFT effect for the reference implementation.
+- **`js/colormaps.ts`** — Shared colormap LUTs and rendering. Exports `COLORMAPS`, `COLORMAP_NAMES`, `applyColormap` (CPU: float data → RGBA via LUT), `renderToOffscreen`, `renderToOffscreenReuse`, and **`GPUColormapEngine`** (WebGPU compute shader for GPU-accelerated colormap). The GPU engine uploads float32 data once, then on histogram slider drag only updates a `vmin/vmax` uniform and reruns the WGSL shader — ~300× faster than the CPU loop for 4K images (1450ms → <5ms for 12 × 4096×4096). Singleton via `getGPUColormapEngine()`, shares `GPUDevice` from `webgpu-fft.ts`. Supports both linked contrast (`apply(vmin, vmax)`) and per-image contrast (`applyPerImage(ranges)`). **Currently wired into Show2D only** — rollout to other widgets in progress (same pattern: init engine, `uploadData` on data change, `apply`/`applyPerImage` on slider drag, CPU fallback).
 - **`js/scalebar.ts`** — Shared scale bar, colorbar, and figure export. Exports `roundToNiceValue`, `formatScaleLabel`, `drawScaleBarHiDPI`, `drawFFTScaleBarHiDPI`, `drawColorbar`, `exportFigure`. HiDPI-aware rendering with automatic unit conversion (Å→nm, mrad→rad). `exportFigure()` creates publication-quality canvas with title, scale bar, colorbar, and annotation callback.
 - **`js/format.ts`** — Data conversion, formatting, and file download. Exports `extractBytes` (DataView→Uint8Array), `extractFloat32` (DataView→Float32Array), `formatNumber` (exponential notation), `downloadBlob` (save Blob as file), `downloadDataView` (save DataView as file).
 - **`js/histogram.ts`** — Histogram computation. Exports `computeHistogramFromBytes` (Float32Array→normalized bins).
@@ -151,7 +218,37 @@ Use the kernel matching your development conda env for notebooks.
 - **Single-file widgets (~2,000 lines each) are intentional.** Each widget is one `index.tsx` with all hooks, effects, handlers, and JSX in a single file. This is optimized for AI-assisted development: all context in one file, no cross-file navigation, grep finds everything. Do not split widgets into smaller files.
 
 - Theme detection and colors are shared via `js/theme.ts`. All widgets support automatic light/dark mode.
-- Functional utilities are shared: `js/webgpu-fft.ts` (FFT), `js/colormaps.ts` (colormap LUTs), `js/theme.ts` (theme).
+- Functional utilities are shared: `js/webgpu-fft.ts` (FFT), `js/colormaps.ts` (colormap LUTs + GPU engine), `js/theme.ts` (theme).
+
+### WebGPU pipeline (GPU-accelerated rendering)
+
+**GPU is the first-class citizen.** All heavy pixel operations must use WebGPU compute shaders as the primary path, with CPU as a fallback only for browsers without WebGPU. Most users are on MacBook (Apple GPU) or desktop with GPU — optimize for the GPU path first, benchmark on GPU, and keep CPU fallback minimal. When adding new per-pixel operations, write the WGSL shader first, then add the CPU fallback.
+
+**No double computation on GPU init.** GPU engine refs (`gpuCmapRef`, `gpuReadyRef`) must be refs (not state). Effects check refs opportunistically — they do NOT re-trigger when GPU becomes available. Data is uploaded to GPU in the data parse effect or the GPU init callback (whichever runs second). This prevents the bug where CPU renders first, then GPU re-renders the same data.
+
+| Stage | CPU path | GPU path | Status |
+|-------|----------|----------|--------|
+| **Colormap** (float32→RGBA) | `applyColormap()` loop | `GPUColormapEngine` WGSL shader | Show2D done, others pending |
+| **FFT** (2D power spectrum) | `fft2d()` / `fft2dAsync()` Worker | `WebGPUFFT.fft2D()` / `fft2DBatch()` | All FFT widgets |
+| **Log scale** (log1p transform) | `applyLogScaleInPlace()` | GPU log1p shader | Planned |
+| **Histogram** (256-bin count) | `computeHistogramFromBytes()` | GPU histogram reduction | Planned |
+| **Volume ray-cast** | — | `webgpu-volume.ts` WGSL shader | Show3DVolume |
+
+**GPU colormap pattern** (reference: Show2D):
+1. Mount: `getGPUColormapEngine()` → `gpuCmapRef`
+2. Data change: `engine.uploadData(idx, processedFloat32)` + `engine.uploadLUT(name, lut)` — upload once
+3. Slider drag: `engine.apply(vmin, vmax)` or `engine.applyPerImage(ranges)` — only updates uniform, ~300× faster
+4. Result: `Uint8ClampedArray[]` RGBA → `putImageData` → offscreen canvas
+
+**Benchmark (12 × 4096×4096, MacBook M5):** CPU colormap = 1450ms, GPU colormap = <5ms.
+
+**WebGPU testing limitation:** Neither Playwright's bundled Chromium, system Chrome (via `channel='chrome'`), nor WebKit expose `navigator.gpu` on this machine. Safari has native WebGPU but cannot be automated via Playwright. **There is currently no automated way to test GPU shader code.** E2E smoke tests always exercise the CPU fallback path. **GPU code paths must be tested by the user in JupyterLab (Safari).** After any GPU shader change:
+1. Open the gold drift notebook (`notebooks/show2d/show2d_gold_drift.ipynb`) in JupyterLab
+2. Open browser console (Cmd+Option+J)
+3. Check for `[Show2D] WebGPU colormap engine initialized` on load
+4. Test: change colormap (inferno → hot → viridis), drag histogram slider, toggle log scale
+5. Check that NO images go black, console shows no WebGPU errors
+6. Never ship GPU code that was only tested via headless E2E — it's the CPU path in disguise
 - Widget-specific UI (typography, spacing, control layout) is inlined per widget.
 - Show3D is the "model" widget — all other widgets follow its layout patterns (header row, bordered canvas box with resize handle, stats bar, control rows + histogram).
 - All widgets must use the same font sizes, control styling, and layout as Show3D/Show4DSTEM. Controls use fontSize 10, labels use fontSize 11, stats use monospace. Histogram rendering, switch styles, and dropdown selects must be visually identical across widgets. Buttons use MUI default uppercase text (no `textTransform: "none"`).
@@ -483,6 +580,32 @@ All parameters compose: find files → filter by `pattern` → `skip` → cap at
 - `Show4DSTEM.free()` — deletes GPU tensor, runs `gc.collect()`, flushes GPU allocator cache (`torch.mps.empty_cache()` on macOS, `torch.cuda.empty_cache()` on Linux)
 - GPU allocators cache freed buffers in a free-list; `del` alone does not return memory to the system
 - Always call `free()` + `del result` when switching between large 4D-STEM datasets in a notebook session
+
+## GPU-First Compute
+
+**Use torch GPU (MPS/CUDA) for compute-heavy array operations on large data.** But profile first — GPU memory transfer overhead can exceed CPU compute for simple operations on Apple MPS.
+
+**When torch GPU wins** (compute-heavy, data stays on GPU):
+- `bin2d()` — spatial binning on stacks of 4K images (~2× faster)
+- FFT, convolution, complex math
+- Batch operations where data is already on GPU (`.to(device)` once, compute many)
+- Synthetic data generation (see notebook conventions)
+
+**When NumPy CPU wins** (simple ops, transfer-dominated):
+- `np.percentile` + `np.clip` on single arrays — MPS transfer overhead > CPU compute
+- Simple statistics (mean, std, min, max) on <1 GB arrays
+- One-shot operations where the GPU transfer cost exceeds the compute savings
+
+Pattern:
+```python
+import torch
+dev = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+t = torch.from_numpy(data).to(dev)
+result = t.mean(dim=(1, 2))  # GPU-accelerated
+output = result.cpu().numpy()
+```
+
+**Rule of thumb:** If the operation is a single pass over data (percentile, clip, min/max), CPU is fine. If the operation involves reshape + reduction on >1M elements (binning, FFT), use GPU. Always benchmark on real data before committing to GPU.
 
 ## Code Style
 

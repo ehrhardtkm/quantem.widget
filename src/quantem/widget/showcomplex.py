@@ -50,6 +50,12 @@ class ShowComplex2D(anywidget.AnyWidget):
         Apply log(1+x) to amplitude before display.
     auto_contrast : bool, default False
         Use percentile-based contrast.
+    vmin : float, optional
+        Minimum value for colormap. Overrides auto-contrast and slider
+        percentiles. Phase mode ignores this (always [-pi, pi]).
+    vmax : float, optional
+        Maximum value for colormap. Overrides auto-contrast and slider
+        percentiles. Phase mode ignores this (always [-pi, pi]).
     show_fft : bool, default False
         Show FFT panel.
     show_stats : bool, default True
@@ -89,6 +95,8 @@ class ShowComplex2D(anywidget.AnyWidget):
     auto_contrast = traitlets.Bool(False).tag(sync=True)
     percentile_low = traitlets.Float(1.0).tag(sync=True)
     percentile_high = traitlets.Float(99.0).tag(sync=True)
+    vmin = traitlets.Float(None, allow_none=True).tag(sync=True)
+    vmax = traitlets.Float(None, allow_none=True).tag(sync=True)
 
     # Scale bar
     pixel_size = traitlets.Float(0.0).tag(sync=True)
@@ -99,7 +107,7 @@ class ShowComplex2D(anywidget.AnyWidget):
     show_fft = traitlets.Bool(False).tag(sync=True)
     fft_window = traitlets.Bool(True).tag(sync=True)
     show_controls = traitlets.Bool(True).tag(sync=True)
-    image_width_px = traitlets.Int(0).tag(sync=True)
+    canvas_size = traitlets.Int(0).tag(sync=True)
     disabled_tools = traitlets.List(traitlets.Unicode()).tag(sync=True)
     hidden_tools = traitlets.List(traitlets.Unicode()).tag(sync=True)
 
@@ -197,12 +205,14 @@ class ShowComplex2D(anywidget.AnyWidget):
         auto_contrast: bool = False,
         percentile_low: float = 1.0,
         percentile_high: float = 99.0,
+        vmin: float | None = None,
+        vmax: float | None = None,
         show_fft: bool = False,
         fft_window: bool = True,
         show_stats: bool = True,
         show_controls: bool = True,
         scale_bar_visible: bool = True,
-        image_width_px: int = 0,
+        canvas_size: int = 0,
         disabled_tools: Optional[List[str]] = None,
         disable_display: bool = False,
         disable_histogram: bool = False,
@@ -288,12 +298,14 @@ class ShowComplex2D(anywidget.AnyWidget):
         self.auto_contrast = auto_contrast
         self.percentile_low = percentile_low
         self.percentile_high = percentile_high
+        self.vmin = vmin
+        self.vmax = vmax
         self.show_fft = show_fft
         self.fft_window = fft_window
         self.show_stats = show_stats
         self.show_controls = show_controls
         self.scale_bar_visible = scale_bar_visible
-        self.image_width_px = image_width_px
+        self.canvas_size = canvas_size
         self.disabled_tools = self._build_disabled_tools(
             disabled_tools=disabled_tools,
             disable_display=disable_display,
@@ -450,7 +462,13 @@ class ShowComplex2D(anywidget.AnyWidget):
     def _normalize_frame(self, frame: np.ndarray) -> np.ndarray:
         if self.log_scale:
             frame = np.log1p(np.maximum(frame, 0))
-        if self.auto_contrast:
+        if self.vmin is not None and self.vmax is not None:
+            vmin = float(self.vmin)
+            vmax = float(self.vmax)
+            if self.log_scale:
+                vmin = float(np.log1p(max(vmin, 0)))
+                vmax = float(np.log1p(max(vmax, 0)))
+        elif self.auto_contrast:
             vmin = float(np.percentile(frame, self.percentile_low))
             vmax = float(np.percentile(frame, self.percentile_high))
         else:
@@ -525,7 +543,13 @@ class ShowComplex2D(anywidget.AnyWidget):
             if self.log_scale and mode in ("amplitude", "real", "imag"):
                 data = np.log1p(np.maximum(data, 0))
 
-            if self.auto_contrast:
+            if self.vmin is not None and self.vmax is not None and mode != "phase":
+                vmin = float(self.vmin)
+                vmax = float(self.vmax)
+                if self.log_scale and mode in ("amplitude", "real", "imag"):
+                    vmin = float(np.log1p(max(vmin, 0)))
+                    vmax = float(np.log1p(max(vmax, 0)))
+            elif self.auto_contrast:
                 vmin = float(np.percentile(data, self.percentile_low))
                 vmax = float(np.percentile(data, self.percentile_high))
             else:
@@ -542,6 +566,9 @@ class ShowComplex2D(anywidget.AnyWidget):
             rgba = (cmap_fn(normalized) * 255).astype(np.uint8)
             img = Image.fromarray(rgba)
 
+        if fmt == "pdf":
+            Image.init()
+            img = img.convert("RGB")
         path.parent.mkdir(parents=True, exist_ok=True)
         img.save(str(path), dpi=(dpi, dpi))
         return path
@@ -559,13 +586,15 @@ class ShowComplex2D(anywidget.AnyWidget):
             "auto_contrast": self.auto_contrast,
             "percentile_low": self.percentile_low,
             "percentile_high": self.percentile_high,
+            "vmin": self.vmin,
+            "vmax": self.vmax,
             "pixel_size": self.pixel_size,
             "scale_bar_visible": self.scale_bar_visible,
             "show_fft": self.show_fft,
             "fft_window": self.fft_window,
             "show_stats": self.show_stats,
             "show_controls": self.show_controls,
-            "image_width_px": self.image_width_px,
+            "canvas_size": self.canvas_size,
             "roi_mode": self.roi_mode,
             "roi_center_row": self.roi_center_row,
             "roi_center_col": self.roi_center_col,
@@ -613,6 +642,8 @@ class ShowComplex2D(anywidget.AnyWidget):
         cmap = self.cmap if mode in ("amplitude", "real", "imag") else "hsv (cyclic)"
         scale = "log" if self.log_scale else "linear"
         contrast = "auto" if self.auto_contrast else "manual"
+        if self.vmin is not None and self.vmax is not None:
+            contrast += f", vmin={self.vmin:.4g}, vmax={self.vmax:.4g}"
         lines.append(f"Display:  {mode} | {cmap} | {contrast} | {scale}")
         if self.show_fft:
             lines[-1] += " | FFT"

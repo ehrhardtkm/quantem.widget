@@ -6,6 +6,7 @@ Unlike Show3D (interactive), Show2D focuses on static visualization.
 """
 
 import json
+import os
 import pathlib
 import io
 import base64
@@ -15,6 +16,8 @@ from enum import StrEnum
 from typing import Optional, Union, List, Self
 
 import anywidget
+import matplotlib
+import matplotlib.patheffects
 import matplotlib.pyplot as plt
 import numpy as np
 import traitlets
@@ -28,6 +31,41 @@ from quantem.widget.tool_parity import (
     normalize_tool_groups,
 )
 
+
+
+def _reject_unknown_kwargs(cls, kwargs: dict) -> None:
+    """Raise TypeError if kwargs contains any key that isn't a declared trait.
+
+    anywidget/traitlets silently accept unknown keys, which let stale notebooks
+    pass obsolete params like ``pixel_size_angstrom=0.5`` with no warning.  This
+    helper catches typos and renamed-trait references at construction time.
+    """
+    traits = set(cls.class_trait_names())
+    unknown = [k for k in kwargs if k not in traits]
+    if unknown:
+        key = sorted(unknown)[0]
+        raise TypeError(
+            f"{cls.__name__}() got unexpected keyword argument {key!r}. "
+            f"Check for typos or a renamed parameter (e.g. canvas_size → size, "
+            f"image_width_px → size, pixel_size_angstrom → pixel_size)."
+        )
+
+
+def _round_to_nice(value: float) -> float:
+    """Round a physical length to a 'nice' value (1, 2, 5, 10, 20, 50, ...)."""
+    if value <= 0:
+        return 1.0
+    exp = math.floor(math.log10(value))
+    base = 10 ** exp
+    mantissa = value / base
+    if mantissa < 1.5:
+        return base
+    elif mantissa < 3.5:
+        return 2 * base
+    elif mantissa < 7.5:
+        return 5 * base
+    else:
+        return 10 * base
 
 
 class Colormap(StrEnum):
@@ -66,8 +104,21 @@ class Show2D(anywidget.AnyWidget):
         Use log scale for intensity mapping.
     auto_contrast : bool, default False
         Use percentile-based contrast.
+    vmin : float, optional
+        Absolute minimum intensity for color mapping. When both vmin and vmax
+        are set, all gallery images share the same intensity scale — essential
+        for A/B visual comparison.
+    vmax : float, optional
+        Absolute maximum intensity for color mapping.
     ncols : int, default 3
         Number of columns in gallery mode.
+    size : int, default 0
+        Canvas rendering size in CSS pixels (the on-screen width of each image).
+        ``0`` uses the frontend default: 500 px for a single image, 300 px per
+        image in gallery mode.  Pass e.g. ``size=800`` to enlarge for a
+        presentation, or ``size=200`` to compress alongside a control panel.
+        This controls **display only** — the underlying image resolution is
+        never resampled; zooming into a 4K image preserves every pixel.
     disabled_tools : list of str, optional
         Tool groups to lock while still showing controls. Supported:
         ``"display"``, ``"histogram"``, ``"stats"``, ``"navigation"``,
@@ -83,6 +134,20 @@ class Show2D(anywidget.AnyWidget):
         ``disabled_tools``.
     hide_* : bool, optional
         Convenience flags mirroring ``disable_*`` for ``hidden_tools``.
+
+    Attributes
+    ----------
+    render_total_ms : int or None
+        End-to-end wall clock from constructor start to first browser paint,
+        populated by a JS→Python round-trip after the first canvas render.
+        ``None`` until the browser has actually painted; also printed to stdout
+        when it fires.  Use to triage "is it Python, wire, or the browser?"
+        during live acquisitions.
+    render_python_build_ms : int or None
+        Subset of ``render_total_ms`` covering Python ``__init__`` only.
+    render_wire_js_ms : int or None
+        Subset covering everything after Python returns: Comm transfer, JS
+        decode, colormap, and canvas paint.
 
     Examples
     --------
@@ -102,11 +167,20 @@ class Show2D(anywidget.AnyWidget):
 
     # =========================================================================
     # Core State
+    # GPU memory budget for display buffers (MB). Each 4K image needs ~192 MB.
+    # 12×4K = 2304 MB fits. 16+ triggers auto-bin.
+    _GPU_DISPLAY_BUDGET_MB = 2500
+
     # =========================================================================
     widget_version = traitlets.Unicode("unknown").tag(sync=True)
     n_images = traitlets.Int(1).tag(sync=True)
     height = traitlets.Int(1).tag(sync=True)
     width = traitlets.Int(1).tag(sync=True)
+    _display_bin_factor = traitlets.Int(1).tag(sync=True)  # 1 = full-res, 2/4/8 = binned
+    _gpu_max_buffer_mb = traitlets.Int(0).tag(sync=True)  # GPU reports maxBufferSize (JS→Python)
+    # Flipped True by JS after the first colormap pass has painted to canvas.
+    # Used by the Python-side truthful timing print (end-to-end wall clock, not just __init__).
+    _js_rendered = traitlets.Bool(False).tag(sync=True)
     frame_bytes = traitlets.Bytes(b"").tag(sync=True)
     labels = traitlets.List(traitlets.Unicode()).tag(sync=True)
     title = traitlets.Unicode("").tag(sync=True)
@@ -118,13 +192,26 @@ class Show2D(anywidget.AnyWidget):
     # =========================================================================
     log_scale = traitlets.Bool(False).tag(sync=True)
     auto_contrast = traitlets.Bool(False).tag(sync=True)
+    vmin = traitlets.Float(None, allow_none=True).tag(sync=True)
+    vmax = traitlets.Float(None, allow_none=True).tag(sync=True)
+    vmins = traitlets.List(trait=traitlets.Float(allow_none=True), allow_none=True, default_value=None).tag(sync=True)
+    vmaxs = traitlets.List(trait=traitlets.Float(allow_none=True), allow_none=True, default_value=None).tag(sync=True)
 
     # =========================================================================
     # Scale Bar
     # =========================================================================
     pixel_size = traitlets.Float(0.0).tag(sync=True)
     scale_bar_visible = traitlets.Bool(True).tag(sync=True)
-    canvas_size = traitlets.Int(0).tag(sync=True)
+    size = traitlets.Int(0).tag(sync=True)  # Canvas rendering size in CSS pixels; 0 = frontend default
+    smooth = traitlets.Bool(False).tag(sync=True)
+    initial_zoom = traitlets.Float(1.0).tag(sync=True)
+    zoom_row = traitlets.Float(None, allow_none=True).tag(sync=True)
+    zoom_col = traitlets.Float(None, allow_none=True).tag(sync=True)
+    link_zoom = traitlets.Bool(False).tag(sync=True)
+    link_pan = traitlets.Bool(False).tag(sync=True)
+    link_contrast = traitlets.Bool(True).tag(sync=True)
+    diff_mode = traitlets.Bool(False).tag(sync=True)
+    diff_reference = traitlets.Int(0).tag(sync=True)
 
     # =========================================================================
     # UI Visibility
@@ -252,6 +339,8 @@ class Show2D(anywidget.AnyWidget):
         show_stats: bool = True,
         log_scale: bool = False,
         auto_contrast: bool = False,
+        vmin: float | list | None = None,
+        vmax: float | list | None = None,
         disabled_tools: Optional[List[str]] = None,
         disable_display: bool = False,
         disable_histogram: bool = False,
@@ -273,12 +362,82 @@ class Show2D(anywidget.AnyWidget):
         hide_profile: bool = False,
         hide_all: bool = False,
         ncols: int = 3,
-        canvas_size: int = 0,
+        size: int = 0,
+        smooth: bool = False,
+        zoom: float = 1.0,
+        zoom_row: float | None = None,
+        zoom_col: float | None = None,
+        link_zoom: bool = False,
+        link_pan: bool = False,
+        link_contrast: bool = True,
+        diff_mode: bool = False,
+        view_box: tuple | list | None = None,
+        display_bin: Union[int, str] = "auto",
         state=None,
         **kwargs,
     ):
+        import time as _time
+        _t0 = _time.perf_counter()
+        # Reject typos and stale kwargs (e.g. image_width_px, pixel_size_angstrom).
+        # anywidget/traitlets silently ignores unknown keys, which hid the
+        # pixel_size_angstrom bug in show2d_all_features.ipynb for months.
+        _reject_unknown_kwargs(type(self), kwargs)
         super().__init__(**kwargs)
+        # hold_sync() batches ALL traitlet assignments into a single comm message
+        # sent when the context manager exits.  Without this, each self.x = y
+        # fires a separate round-trip over the ZMQ/websocket channel, which
+        # can add 20+ seconds for a 30-image gallery in VS Code Jupyter.
+        with self.hold_sync():
+            self._init_sync(
+                data=data, labels=labels, title=title, cmap=cmap,
+                pixel_size=pixel_size, scale_bar_visible=scale_bar_visible,
+                show_fft=show_fft, fft_window=fft_window,
+                show_controls=show_controls, show_stats=show_stats,
+                log_scale=log_scale, auto_contrast=auto_contrast,
+                vmin=vmin, vmax=vmax,
+                disabled_tools=disabled_tools,
+                disable_display=disable_display,
+                disable_histogram=disable_histogram,
+                disable_stats=disable_stats,
+                disable_navigation=disable_navigation,
+                disable_view=disable_view,
+                disable_export=disable_export,
+                disable_roi=disable_roi,
+                disable_profile=disable_profile,
+                disable_all=disable_all,
+                hidden_tools=hidden_tools,
+                hide_display=hide_display,
+                hide_histogram=hide_histogram,
+                hide_stats=hide_stats,
+                hide_navigation=hide_navigation,
+                hide_view=hide_view,
+                hide_export=hide_export,
+                hide_roi=hide_roi,
+                hide_profile=hide_profile,
+                hide_all=hide_all,
+                ncols=ncols, size=size, smooth=smooth, zoom=zoom,
+                zoom_row=zoom_row, zoom_col=zoom_col,
+                link_zoom=link_zoom, link_pan=link_pan, link_contrast=link_contrast,
+                diff_mode=diff_mode, view_box=view_box,
+                display_bin=display_bin, state=state, _t0=_t0)
+
+    def _init_sync(self, *, data, labels, title, cmap, pixel_size,
+                   scale_bar_visible, show_fft, fft_window,
+                   show_controls, show_stats, log_scale, auto_contrast,
+                   vmin, vmax, disabled_tools,
+                   disable_display, disable_histogram, disable_stats,
+                   disable_navigation, disable_view, disable_export,
+                   disable_roi, disable_profile, disable_all,
+                   hidden_tools, hide_display, hide_histogram, hide_stats,
+                   hide_navigation, hide_view, hide_export, hide_roi,
+                   hide_profile, hide_all,
+                   ncols, size, smooth, zoom, zoom_row, zoom_col,
+                   link_zoom, link_pan, link_contrast, diff_mode, view_box,
+                   display_bin, state, _t0):
+        import time as _time
         self.widget_version = resolve_widget_version()
+        self._display_data = None  # initialized after data setup
+        self._display_bin = 1
 
         # Check if data is an IOResult and extract metadata
         if isinstance(data, IOResult):
@@ -323,8 +482,15 @@ class Show2D(anywidget.AnyWidget):
         if data.ndim == 2:
             data = data[np.newaxis, ...]
 
-        self._data = data.astype(np.float32)
-        self._data_original = [self._data[i].copy() for i in range(self._data.shape[0])]
+        # Avoid redundant copy: np.asarray is a no-op when already float32 + contiguous
+        if data.dtype == np.float32:
+            self._data = np.array(data, dtype=np.float32, copy=True)
+        else:
+            self._data = np.asarray(data, dtype=np.float32)
+        # Store originals for rotation reset — views into _data (no copy).
+        # Only materialized as independent copies when a rotation is applied.
+        self._data_original = [self._data[i] for i in range(self._data.shape[0])]
+        self._originals_are_views = True
         self.n_images = int(data.shape[0])
         self.height = int(data.shape[1])
         self.width = int(data.shape[2])
@@ -341,7 +507,23 @@ class Show2D(anywidget.AnyWidget):
         self.cmap = cmap
         self.pixel_size = pixel_size
         self.scale_bar_visible = scale_bar_visible
-        self.canvas_size = canvas_size
+        self.size = size
+        self.smooth = smooth
+        # view_box sugar: sets zoom + zoom_row/col to center on box
+        if view_box is not None:
+            r0, r1, c0, c1 = [float(v) for v in view_box]
+            box_h = max(1.0, r1 - r0)
+            box_w = max(1.0, c1 - c0)
+            zoom = float(min(self.height / box_h, self.width / box_w))
+            zoom_row = (r0 + r1) / 2
+            zoom_col = (c0 + c1) / 2
+        self.initial_zoom = zoom
+        self.zoom_row = zoom_row
+        self.zoom_col = zoom_col
+        self.link_zoom = link_zoom
+        self.link_pan = link_pan
+        self.link_contrast = link_contrast
+        self.diff_mode = diff_mode if self.n_images >= 2 else False
         if show_fft and self.height * self.width > 2048 * 2048:
             warnings.warn(
                 f"FFT on {self.height}×{self.width} image ({self.height * self.width / 1e6:.1f}M pixels) "
@@ -354,6 +536,23 @@ class Show2D(anywidget.AnyWidget):
         self.show_stats = show_stats
         self.log_scale = log_scale
         self.auto_contrast = auto_contrast
+        # Accept scalar OR list for vmin/vmax. List → per-image (vmins/vmaxs).
+        if isinstance(vmin, (list, tuple)) or isinstance(vmax, (list, tuple)):
+            n = self.n_images
+            def _expand(v):
+                if v is None: return [None] * n
+                if isinstance(v, (list, tuple)):
+                    if len(v) != n:
+                        raise ValueError(f"vmin/vmax list length {len(v)} != n_images {n}")
+                    return [None if x is None else float(x) for x in v]
+                return [float(v)] * n
+            self.vmins = _expand(vmin)
+            self.vmaxs = _expand(vmax)
+            self.vmin = None
+            self.vmax = None
+        else:
+            self.vmin = vmin
+            self.vmax = vmax
         self.disabled_tools = self._build_disabled_tools(
             disabled_tools=disabled_tools,
             disable_display=disable_display,
@@ -380,10 +579,46 @@ class Show2D(anywidget.AnyWidget):
         )
         self.ncols = ncols
 
-        # Compute initial stats
+        # Auto-bin for display: keep full-res in _data, send binned to JS.
+        # GPU memory budget: ~2 GB for display buffers (128 MB per image at 4K).
+        # At 4K: max ~16 full-res. Beyond that, auto-downsample.
+        if display_bin == "auto":
+            # Each 4K image needs ~192 MB GPU buffers (float32 + RGBA + read)
+            # Tested: 12×4K (2.3 GB) works, 24×4K (4.6 GB) OOMs
+            # Budget: 2.5 GB allows 12×4K full-res, bins above that
+            gpu_budget_mb = self._GPU_DISPLAY_BUDGET_MB
+            per_image_mb = (self.height * self.width * 4 * 3) / (1024 * 1024)  # 3 buffers
+            total_mb = self.n_images * per_image_mb
+            if total_mb > gpu_budget_mb:
+                # Find minimum bin factor to fit
+                for bf in [2, 4, 8]:
+                    binned_mb = self.n_images * per_image_mb / (bf * bf)
+                    if binned_mb <= gpu_budget_mb:
+                        self._display_bin = bf
+                        break
+                else:
+                    self._display_bin = 8
+        elif isinstance(display_bin, int) and display_bin > 1:
+            self._display_bin = display_bin
+
+        if self._display_bin > 1:
+            from quantem.widget.array_utils import bin2d
+            orig_h, orig_w = self._data.shape[1], self._data.shape[2]
+            self._display_data = bin2d(self._data, factor=self._display_bin, mode="mean")
+            self.height = int(self._display_data.shape[1])
+            self.width = int(self._display_data.shape[2])
+            if pixel_size > 0:
+                self.pixel_size = pixel_size * self._display_bin
+            self._display_bin_factor = self._display_bin
+            print(f"  Display bin {self._display_bin}×: {orig_h}×{orig_w} → {self.height}×{self.width} ({self._display_data.nbytes // 1024 // 1024} MB)")
+        else:
+            self._display_data = self._data
+            self._display_bin_factor = 1
+
+        # Compute initial stats (from full-res data)
         self._compute_all_stats()
 
-        # Send raw float32 data to JS (normalization happens in JS for speed)
+        # Send display data to JS (possibly binned)
         self._update_all_frames()
 
         self.selected_idx = 0
@@ -397,6 +632,42 @@ class Show2D(anywidget.AnyWidget):
             else:
                 state = unwrap_state_payload(state)
             self.load_state_dict(state)
+
+        # Stash wall-clock start on the instance; the observer below prints the
+        # TRUE end-to-end time after JS signals first paint.  The Python-only
+        # __init__ number is misleading for widget UX — a widget is not "done"
+        # until the browser has painted its first frame.
+        self._init_t0 = _t0
+        self._init_py_elapsed_ms = (_time.perf_counter() - _t0) * 1000
+        self.observe(self._on_first_render, names=["_js_rendered"])
+
+    def _on_first_render(self, change):
+        import time as _time
+        if not change.get("new"):
+            return
+        total_ms = (_time.perf_counter() - self._init_t0) * 1000
+        py_ms = self._init_py_elapsed_ms
+        shape = (f"{self.n_images}×{self.height}×{self.width}"
+                 if self.n_images > 1 else f"{self.height}×{self.width}")
+        mem = self._data.nbytes
+        mem_str = f"{mem / (1 << 20):.0f} MB" if mem >= 1 << 20 else f"{mem / (1 << 10):.0f} KB"
+        # Expose as attributes so tests and notebooks can assert on them.
+        # These are the ground truth for "did JS actually paint" — if they're
+        # None, the JS side never signaled first render.
+        self.render_total_ms = int(total_ms)
+        self.render_python_build_ms = int(py_ms)
+        self.render_wire_js_ms = int(total_ms - py_ms)
+        print(
+            f"Show2D: {shape} {mem_str} — "
+            f"rendered in {total_ms:.0f} ms (Python build {py_ms:.0f} ms, "
+            f"wire+JS {total_ms - py_ms:.0f} ms)",
+            flush=True,
+        )
+        # Detach observer: one-shot, we only care about the first paint.
+        try:
+            self.unobserve(self._on_first_render, names=["_js_rendered"])
+        except Exception:
+            pass
 
     def set_image(self, data, labels=None):
         """Replace the displayed image(s). Preserves all display settings."""
@@ -414,11 +685,40 @@ class Show2D(anywidget.AnyWidget):
             data = to_numpy(data)
         if data.ndim == 2:
             data = data[np.newaxis, ...]
-        self._data = data.astype(np.float32)
-        self._data_original = [self._data[i].copy() for i in range(self._data.shape[0])]
+        if data.dtype == np.float32:
+            self._data = np.array(data, dtype=np.float32, copy=True)
+        else:
+            self._data = np.asarray(data, dtype=np.float32)
+        self._data_original = [self._data[i] for i in range(self._data.shape[0])]
+        self._originals_are_views = True
         self.n_images = int(data.shape[0])
-        self.height = int(data.shape[1])
-        self.width = int(data.shape[2])
+
+        # Auto-bin for display (reuse existing _display_bin or recompute)
+        gpu_budget_mb = 2500
+        per_image_mb = (data.shape[1] * data.shape[2] * 4 * 3) / (1024 * 1024)
+        total_mb = self.n_images * per_image_mb
+        self._display_bin = 1
+        if total_mb > gpu_budget_mb:
+            for bf in [2, 4, 8]:
+                if total_mb / (bf * bf) <= gpu_budget_mb:
+                    self._display_bin = bf
+                    break
+            else:
+                self._display_bin = 8
+
+        if self._display_bin > 1:
+            from quantem.widget.array_utils import bin2d
+            self._display_data = bin2d(self._data, factor=self._display_bin, mode="mean")
+            self.height = int(self._display_data.shape[1])
+            self.width = int(self._display_data.shape[2])
+            self._display_bin_factor = self._display_bin
+            print(f"  Display bin {self._display_bin}×: {data.shape[1]}×{data.shape[2]} → {self.height}×{self.width}")
+        else:
+            self._display_data = self._data
+            self.height = int(data.shape[1])
+            self.width = int(data.shape[2])
+            self._display_bin_factor = 1
+
         self.image_rotations = [0] * self.n_images
         if labels is not None:
             self.labels = list(labels)
@@ -435,13 +735,18 @@ class Show2D(anywidget.AnyWidget):
         return f"Show2D({self.height}×{self.width}, cmap={self.cmap})"
 
     def _repr_mimebundle_(self, **kwargs):
-        """Return widget view + static PNG fallback.
+        """Return widget view + (optionally) static PNG fallback.
 
-        Live Jupyter renders the interactive widget. Static contexts
-        (nbsphinx, GitHub, nbviewer) fall back to the embedded PNG.
-        Images are downsampled to at most 256px per side for fast rendering.
+        Live Jupyter renders the interactive widget; the PNG fallback is only
+        consumed by nbsphinx / GitHub / nbviewer when the widget view cannot be
+        rendered.  Building the fallback runs matplotlib over every gallery image
+        (~1.7 s for a 30×512² stack) and that cost pays off only in static builds.
+        Gate it behind ``QUANTEM_WIDGET_STATIC_FALLBACK=1`` so interactive sessions
+        return immediately.
         """
         bundle = super()._repr_mimebundle_(**kwargs)
+        if not os.environ.get("QUANTEM_WIDGET_STATIC_FALLBACK"):
+            return bundle
         data_dict = bundle[0] if isinstance(bundle, tuple) else bundle
         n = self.n_images
         ncols = min(self.ncols, n)
@@ -479,7 +784,13 @@ class Show2D(anywidget.AnyWidget):
     def _normalize_frame(self, frame: np.ndarray) -> np.ndarray:
         if self.log_scale:
             frame = np.log1p(np.maximum(frame, 0))
-        if self.auto_contrast:
+        if self.vmin is not None and self.vmax is not None:
+            vmin = float(self.vmin)
+            vmax = float(self.vmax)
+            if self.log_scale:
+                vmin = float(np.log1p(max(vmin, 0)))
+                vmax = float(np.log1p(max(vmax, 0)))
+        elif self.auto_contrast:
             vmin = float(np.percentile(frame, 2))
             vmax = float(np.percentile(frame, 98))
         else:
@@ -497,8 +808,15 @@ class Show2D(anywidget.AnyWidget):
         idx: int | None = None,
         format: str | None = None,
         dpi: int = 150,
+        title: bool | str = False,
+        colorbar: bool = False,
+        scalebar: bool = False,
     ) -> pathlib.Path:
-        """Save current image as PNG or PDF.
+        """Save current image as PNG, PDF, or TIFF.
+
+        When ``title``, ``colorbar``, or ``scalebar`` are enabled, the output
+        is a publication-quality figure rendered via matplotlib. Otherwise a
+        raw colormapped image is saved directly (faster, exact pixel output).
 
         Parameters
         ----------
@@ -507,9 +825,15 @@ class Show2D(anywidget.AnyWidget):
         idx : int, optional
             Image index in gallery mode. Defaults to current selected_idx.
         format : str, optional
-            'png' or 'pdf'. If omitted, inferred from file extension.
+            'png', 'pdf', or 'tiff'. If omitted, inferred from file extension.
         dpi : int, default 150
-            Output DPI metadata.
+            Output DPI.
+        title : bool or str, default False
+            ``True`` uses the widget title, a string sets a custom title.
+        colorbar : bool, default False
+            Include a colorbar showing the intensity mapping.
+        scalebar : bool, default False
+            Include a scale bar (requires ``pixel_size > 0``).
 
         Returns
         -------
@@ -531,11 +855,85 @@ class Show2D(anywidget.AnyWidget):
         frame = self._data[i]
         normalized = self._normalize_frame(frame)
         cmap_fn = colormaps.get_cmap(self.cmap)
-        rgba = (cmap_fn(normalized / 255.0) * 255).astype(np.uint8)
-
-        img = Image.fromarray(rgba)
         path.parent.mkdir(parents=True, exist_ok=True)
-        img.save(str(path), dpi=(dpi, dpi))
+
+        use_figure = title or colorbar or scalebar
+        if not use_figure:
+            rgba = (cmap_fn(normalized / 255.0) * 255).astype(np.uint8)
+            img = Image.fromarray(rgba)
+            if fmt == "pdf":
+                Image.init()
+                img = img.convert("RGB")
+            img.save(str(path), dpi=(dpi, dpi))
+            return path
+
+        # Publication-quality figure via matplotlib
+        h, w = frame.shape
+        aspect = h / w
+        fig_w = 6
+        fig, ax = plt.subplots(figsize=(fig_w, fig_w * aspect))
+        im = ax.imshow(normalized, cmap=cmap_fn, vmin=0, vmax=255, origin="upper")
+        ax.axis("off")
+
+        if title:
+            label = title if isinstance(title, str) else self.title
+            if label:
+                ax.set_title(label, fontsize=14, fontweight="bold", pad=8)
+
+        if colorbar:
+            # Map 0–255 back to data-space values for tick labels
+            if self.log_scale:
+                frame_proc = np.log1p(np.maximum(frame, 0))
+            else:
+                frame_proc = frame
+            if self.vmin is not None and self.vmax is not None:
+                dmin = float(self.vmin)
+                dmax = float(self.vmax)
+                if self.log_scale:
+                    dmin = float(np.log1p(max(dmin, 0)))
+                    dmax = float(np.log1p(max(dmax, 0)))
+            elif self.auto_contrast:
+                dmin = float(np.percentile(frame_proc, 2))
+                dmax = float(np.percentile(frame_proc, 98))
+            else:
+                dmin = float(frame_proc.min())
+                dmax = float(frame_proc.max())
+            cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            n_ticks = 5
+            tick_positions = np.linspace(0, 255, n_ticks)
+            tick_labels = [f"{dmin + (dmax - dmin) * t / 255:.4g}" for t in tick_positions]
+            cb.set_ticks(tick_positions)
+            cb.set_ticklabels(tick_labels)
+
+        if scalebar and self.pixel_size > 0:
+            from matplotlib.patches import FancyBboxPatch
+            # Compute a nice scale bar length
+            target_frac = 0.2  # ~20% of image width
+            raw_length_px = target_frac * w
+            raw_length_phys = raw_length_px * self.pixel_size  # in Å
+            nice = _round_to_nice(raw_length_phys)
+            bar_px = nice / self.pixel_size
+            if nice >= 10:
+                label_text = f"{nice / 10:.4g} nm"
+            else:
+                label_text = f"{nice:.4g} Å"
+            margin = 0.03
+            bar_y = h * (1 - margin) - 2
+            bar_x = w * (1 - margin) - bar_px
+            ax.plot([bar_x, bar_x + bar_px], [bar_y, bar_y],
+                    color="white", linewidth=3, solid_capstyle="butt")
+            ax.plot([bar_x, bar_x + bar_px], [bar_y, bar_y],
+                    color="black", linewidth=1, solid_capstyle="butt")
+            ax.text(bar_x + bar_px / 2, bar_y - h * 0.02, label_text,
+                    color="white", fontsize=10, fontweight="bold",
+                    ha="center", va="bottom",
+                    path_effects=[
+                        matplotlib.patheffects.withStroke(linewidth=2, foreground="black")
+                    ])
+
+        fig.savefig(str(path), dpi=dpi, bbox_inches="tight",
+                    facecolor="white", pad_inches=0.1)
+        plt.close(fig)
         return path
 
     def state_dict(self):
@@ -544,6 +942,8 @@ class Show2D(anywidget.AnyWidget):
             "cmap": self.cmap,
             "log_scale": self.log_scale,
             "auto_contrast": self.auto_contrast,
+            "vmin": self.vmin,
+            "vmax": self.vmax,
             "show_stats": self.show_stats,
             "show_fft": self.show_fft,
             "fft_window": self.fft_window,
@@ -552,7 +952,17 @@ class Show2D(anywidget.AnyWidget):
             "hidden_tools": self.hidden_tools,
             "pixel_size": self.pixel_size,
             "scale_bar_visible": self.scale_bar_visible,
-            "canvas_size": self.canvas_size,
+            "size": self.size,
+            "smooth": self.smooth,
+            "initial_zoom": self.initial_zoom,
+            "vmins": self.vmins,
+            "vmaxs": self.vmaxs,
+            "link_zoom": self.link_zoom,
+            "link_pan": self.link_pan,
+            "link_contrast": self.link_contrast,
+            "zoom_row": self.zoom_row,
+            "zoom_col": self.zoom_col,
+            "diff_mode": self.diff_mode,
             "ncols": self.ncols,
             "selected_idx": self.selected_idx,
             "roi_active": self.roi_active,
@@ -560,6 +970,7 @@ class Show2D(anywidget.AnyWidget):
             "roi_selected_idx": self.roi_selected_idx,
             "profile_line": self.profile_line,
             "image_rotations": list(self.image_rotations),
+            "display_bin": self._display_bin,
         }
 
     def save(self, path: str):
@@ -567,8 +978,14 @@ class Show2D(anywidget.AnyWidget):
 
     def load_state_dict(self, state):
         for key, val in state.items():
+            # Silent migrations for renamed keys in older saved state files.
             if key == "pixel_size_angstrom":
                 key = "pixel_size"
+            elif key == "canvas_size":
+                key = "size"
+            if key == "display_bin":
+                self._display_bin = val
+                continue
             if hasattr(self, key):
                 setattr(self, key, val)
 
@@ -589,7 +1006,12 @@ class Show2D(anywidget.AnyWidget):
             lines.append(f"Data:     min={float(arr.min()):.4g}  max={float(arr.max()):.4g}  mean={float(arr.mean()):.4g}")
         cmap = self.cmap
         scale = "log" if self.log_scale else "linear"
-        contrast = "auto contrast" if self.auto_contrast else "manual contrast"
+        if self.vmin is not None and self.vmax is not None:
+            contrast = f"vmin={self.vmin:.4g}, vmax={self.vmax:.4g}"
+        elif self.auto_contrast:
+            contrast = "auto contrast"
+        else:
+            contrast = "manual contrast"
         display = f"{cmap} | {contrast} | {scale}"
         if self.show_fft:
             display += " | FFT"
@@ -609,27 +1031,46 @@ class Show2D(anywidget.AnyWidget):
         if non_zero:
             parts = [f"#{i}={deg}°" for i, deg in non_zero]
             lines.append(f"Rotated:  {', '.join(parts)}")
+        rt = getattr(self, "render_total_ms", None)
+        if rt is not None:
+            pb = getattr(self, "render_python_build_ms", 0)
+            wj = getattr(self, "render_wire_js_ms", 0)
+            lines.append(f"Rendered: {rt} ms total (Python build {pb} ms, wire+JS {wj} ms)")
+        else:
+            lines.append("Rendered: (pending first browser paint)")
         print("\n".join(lines))
 
     def _compute_all_stats(self):
-        """Compute statistics for all images."""
-        means, mins, maxs, stds = [], [], [], []
-        for i in range(self.n_images):
-            img = self._data[i]
-            means.append(float(np.mean(img)))
-            mins.append(float(np.min(img)))
-            maxs.append(float(np.max(img)))
-            stds.append(float(np.std(img)))
-        self.stats_mean = means
-        self.stats_min = mins
-        self.stats_max = maxs
-        self.stats_std = stds
+        """Compute statistics for all images (vectorized over all frames)."""
+        # Vectorized reduction over (H, W) is faster than per-image loops
+        # for large galleries (e.g. 12×4096×4096: 164ms vs 191ms).
+        axes = (1, 2) if self._data.ndim == 3 else None
+        self.stats_mean = np.mean(self._data, axis=axes).ravel().tolist()
+        self.stats_min = np.min(self._data, axis=axes).ravel().tolist()
+        self.stats_max = np.max(self._data, axis=axes).ravel().tolist()
+        self.stats_std = np.std(self._data, axis=axes).ravel().tolist()
 
     def _update_all_frames(self):
-        """Send raw float32 data to JS (normalization happens in JS for speed)."""
-        self.frame_bytes = self._data.tobytes()
+        """Send display data to JS (possibly binned for large galleries)."""
+        data = self._display_data if self._display_data is not None else self._data
+        self.frame_bytes = data.tobytes()
 
     def _apply_rotations(self):
+        # Materialize originals as independent copies only when a non-zero
+        # rotation exists (they start as views into _data to avoid 800MB copy at init)
+        has_rotation = any(
+            (self.image_rotations[i] if i < len(self.image_rotations) else 0) % 4 != 0
+            for i in range(len(self._data_original))
+        )
+        # No-rotation fast path: skip 30+ MB of redundant tobytes + stats recomputation
+        # on every widget init.  The observer fires once when image_rotations = [0]*n
+        # is assigned in __init__; without this guard that triggered a full frame
+        # rebuild + stats recompute for a no-op.
+        if not has_rotation and self._originals_are_views:
+            return
+        if self._originals_are_views and has_rotation:
+            self._data_original = [img.copy() for img in self._data_original]
+            self._originals_are_views = False
         rotated = []
         for i, orig in enumerate(self._data_original):
             k = self.image_rotations[i] if i < len(self.image_rotations) else 0
@@ -653,8 +1094,15 @@ class Show2D(anywidget.AnyWidget):
                 padded.append(np.pad(img, ((pad_top, pad_bot), (pad_left, pad_right)), mode="constant", constant_values=0))
             rotated = padded
         self._data = np.stack(rotated).astype(np.float32)
-        self.height = int(self._data.shape[1])
-        self.width = int(self._data.shape[2])
+        # Recompute display data if binning is active
+        if self._display_bin > 1:
+            from quantem.widget.array_utils import bin2d
+            self._display_data = bin2d(self._data, factor=self._display_bin, mode="mean")
+        else:
+            self._display_data = self._data
+        display = self._display_data if self._display_data is not None else self._data
+        self.height = int(display.shape[1])
+        self.width = int(display.shape[2])
         self._compute_all_stats()
         self._update_all_frames()
 

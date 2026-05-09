@@ -62,6 +62,10 @@
       "tool_groups": ["display", "export", "all"],
       "aliases": {}
     },
+    "ShowDiffraction": {
+      "tool_groups": ["display", "histogram", "stats", "navigation", "view", "export", "spots", "all"],
+      "aliases": {}
+    },
     "ShowPDF": {
       "tool_groups": ["display", "mask", "parameters", "stats", "export", "all"],
       "aliases": {}

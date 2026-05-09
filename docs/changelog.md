@@ -1,5 +1,47 @@
 # changelog
 
+## v0.0.16 (unreleased)
+
+### Show2D (drift comparison + framing)
+- **`smooth=True`** toggle — bilinear vs pixelated. Wires `ctx.imageSmoothingEnabled` (CSS `image-rendering` alone is a no-op when canvas buffer == display size).
+- **MAX_ZOOM 10× → 20×** for tighter inspection.
+- **`zoom=N`** constructor param — initial zoom; `R`/double-click reset returns to this home view.
+- **`zoom_row`, `zoom_col`** — initial pan target; image (row, col) lands at canvas center on mount.
+- **`view_box=(r0, r1, c0, c1)`** — sugar that fits a row/col rectangle to the canvas.
+- **`vmin=[a, b], vmax=[c, d]`** — per-image absolute contrast (scalar still applies to all).
+- **`link_zoom`, `link_pan`, `link_contrast`** constructor params + UI toggles. `Link Pan` is now independent of `Link Zoom` (same magnification, different ROI per panel).
+- **`diff_mode=True`** when `n_images == 2` — single panel showing A − B with symmetric vmin/vmax around 0; `Diff:` UI switch.
+- **`w.align()`** method — phase cross-correlation between image 0 and 1; sets `align_dy/dx` so diff is drift-cancelled.
+
+### Show2D
+- **WebGPU-accelerated colormap** — histogram slider drag on 12 × 4096×4096 gallery now runs a WGSL compute shader instead of a CPU pixel loop; ~300× faster (1450ms → <5ms for 201M pixels); auto-detects WebGPU, falls back to CPU seamlessly
+- **batched gallery FFT** — gallery mode submits all FFTs to WebGPU with batched readback instead of 12 sequential GPU↔CPU round-trips; pulsing loading overlay shows `"FFT 12× batched (WebGPU)"` while computing
+- **FFT loading indicator** — pulsing overlay on FFT panels during compute with backend info (WebGPU / CPU Worker) and per-image progress; images are interactive immediately while FFTs compute in background
+
+### IO
+- **Velox EMD fast path** — `IO.file()` and `IO.folder()` detect Velox EMD files and read them directly with h5py, bypassing rsciio; reads uint16→float32 with no float64 intermediate (halves peak memory); 13ms per 4096×4096 image
+- **full Velox metadata extraction** — 361 metadata fields parsed from the HDF5 JSON blob: voltage, convergence angle, camera length, dwell time, detector collection angles, stage position, magnification, sample ID, instrument model; all stored in `IOResult.metadata` as numeric types (auto-converted from Velox string encoding)
+- **`describe()` for Velox EMDs** — curated summary with human-readable units (kV, mrad, mm, µs, nA); `describe(keys=["DwellTime", "AccelerationVoltage"])` for specific fields
+- **timing auto-print** — `IO.file()`, `IO.folder()`, and `Show2D()` print shape, memory, and elapsed time automatically; no manual benchmarking code needed in notebooks
+
+### Show2D (constructor)
+- **deferred `_data_original` copy** — originals stored as views into `_data` (not independent copies) until a rotation is applied; saves 800MB for a 12 × 4K gallery
+- **vectorized stats** — `np.mean(data, axis=(1,2))` instead of per-image loop
+
+### Show2D, Show3D (perf + truthful timing)
+- **`_repr_mimebundle_` matplotlib hog removed** — the Show2D static PNG fallback for nbsphinx/GitHub was running `matplotlib.pyplot.subplots` + `savefig` on every live-Jupyter display (~1.7s for a 30-image gallery, silently dropped because the widget-view MIME wins). Now gated behind `QUANTEM_WIDGET_STATIC_FALLBACK=1`; live Jupyter returns the bundle in ~0ms.
+- **`_apply_rotations` no-op fast-path** — initial `image_rotations = [0]*n` assignment no longer triggers a redundant stats + 31 MB `tobytes` rebuild; saves ~25 ms per init.
+- **truthful first-render print** — replaces the misleading `Show2D/3D: … in X ms` constructor print (Python-only, ignored `_repr_mimebundle_` + wire + JS). New print fires ONCE after JS signals first canvas paint: `Show2D: 30×512×512 30 MB — rendered in 420 ms (Python build 56 ms, wire+JS 364 ms)`. Requires new `_js_rendered` trait flipped by JS after two rAFs.
+
+### ShowComplex2D
+- **breaking:** `image_width_px` renamed to `canvas_size` — matches Show2D/Show3D/Mark2D convention. Pass `canvas_size=800` (0 = auto, 500 px default).
+
+### Align2D
+- `canvas_size` default changed from 300 to 0 — matches the "0 = use frontend default" convention used everywhere else. Frontend still renders at 300 px when unspecified. No visual change; just API consistency.
+
+### Developer / notebooks
+- **`enable_hmr()`** helper in `quantem.widget` — spawns `npm run dev` as a background subprocess (survives kernel restart via pidfile), sets `ANYWIDGET_HMR=1`. Drop `enable_hmr()` in any notebook's first cell to get widget hot-reload without opening a second terminal. `disable_hmr()` to stop.
+
 ## v0.0.15 (2026-03-22)
 
 ### New widgets

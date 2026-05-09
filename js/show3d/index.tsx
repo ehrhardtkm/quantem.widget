@@ -106,7 +106,7 @@ const compactButton = {
   },
 };
 
-import { COLORMAPS, COLORMAP_NAMES, renderToOffscreen, renderToOffscreenReuse } from "../colormaps";
+import { COLORMAPS, COLORMAP_NAMES, renderToOffscreen, renderToOffscreenReuse, getGPUColormapEngine, GPUColormapEngine } from "../colormaps";
 
 // Info tooltip component (matching Show4DSTEM)
 function InfoTooltip({ text, theme = "dark" }: { text: React.ReactNode; theme?: "light" | "dark" }) {
@@ -709,6 +709,20 @@ function Show3D() {
   const [width] = useModelState<number>("width");
   const [height] = useModelState<number>("height");
   const [frameBytes] = useModelState<DataView>("frame_bytes");
+
+  // Truthful first-render signal: flipped ONCE after the first frame_bytes
+  // arrives and the browser has had time to composite two frames.  Python side
+  // observes `_js_rendered` and prints the real end-to-end wall clock, not the
+  // misleading Python-only __init__ number.
+  const [, setJsRendered] = useModelState<boolean>("_js_rendered");
+  const firstRenderFiredRef = React.useRef(false);
+  React.useEffect(() => {
+    if (firstRenderFiredRef.current) return;
+    if (!frameBytes || frameBytes.byteLength === 0) return;
+    firstRenderFiredRef.current = true;
+    requestAnimationFrame(() => requestAnimationFrame(() => setJsRendered(true)));
+  }, [frameBytes, setJsRendered]);
+
   const [labels] = useModelState<string[]>("labels");
   const [title] = useModelState<string>("title");
   const [dimLabel] = useModelState<string>("dim_label");
@@ -725,7 +739,7 @@ function Show3D() {
   const [loopStart, setLoopStart] = useModelState<number>("loop_start");
   const [loopEnd, setLoopEnd] = useModelState<number>("loop_end");
   const [bookmarkedFrames, setBookmarkedFrames] = useModelState<number[]>("bookmarked_frames");
-  const [playbackPath, setPlaybackPath] = useModelState<number[]>("playback_path");
+  const [playbackPath] = useModelState<number[]>("playback_path");
 
   // Boomerang direction ref (avoids stale closure in setInterval)
   const bounceDirRef = React.useRef<1 | -1>(1);
@@ -743,6 +757,8 @@ function Show3D() {
   const [autoContrast, setAutoContrast] = useModelState<boolean>("auto_contrast");
   const [percentileLow] = useModelState<number>("percentile_low");
   const [percentileHigh] = useModelState<number>("percentile_high");
+  const [traitVmin] = useModelState<number | null>("vmin");
+  const [traitVmax] = useModelState<number | null>("vmax");
   const [dataMin] = useModelState<number>("data_min");
   const [dataMax] = useModelState<number>("data_max");
   // Scale bar
@@ -750,7 +766,7 @@ function Show3D() {
   const [scaleBarVisible] = useModelState<boolean>("scale_bar_visible");
 
   // Customization
-  const [canvasSizeTrait] = useModelState<number>("canvas_size");
+  const [canvasSizeTrait] = useModelState<number>("size");
 
   // Timestamps
   const [timestamps] = useModelState<number[]>("timestamps");
@@ -759,7 +775,7 @@ function Show3D() {
   const [roiActive, setRoiActive] = useModelState<boolean>("roi_active");
   const [roiList, setRoiList] = useModelState<ROIItem[]>("roi_list");
   const [roiSelectedIdx, setRoiSelectedIdx] = useModelState<number>("roi_selected_idx");
-  const [roiStats] = useModelState<Record<string, number>>("roi_stats");
+  const [_roiStats] = useModelState<Record<string, number>>("roi_stats");
   const [roiPlotData] = useModelState<DataView>("roi_plot_data");
   const [newRoiShape, setNewRoiShape] = React.useState<"circle" | "square" | "rectangle" | "annular">("square");
 
@@ -899,10 +915,20 @@ function Show3D() {
   const gpuFFTRef = React.useRef<WebGPUFFT | null>(null);
   const [gpuReady, setGpuReady] = React.useState(false);
   const fftOffscreenRef = React.useRef<HTMLCanvasElement | null>(null);
+  // WebGPU colormap engine (GPU-accelerated colormap for 4K frames)
+  const gpuCmapRef = React.useRef<GPUColormapEngine | null>(null);
+  const gpuCmapReadyRef = React.useRef(false);
 
   React.useEffect(() => {
     getWebGPUFFT().then(fft => {
       if (fft) { gpuFFTRef.current = fft; setGpuReady(true); }
+    });
+    getGPUColormapEngine().then(engine => {
+      if (engine) {
+        gpuCmapRef.current = engine;
+        gpuCmapReadyRef.current = true;
+        console.log("[Show3D] WebGPU colormap engine initialized");
+      }
     });
   }, []);
 
@@ -1090,6 +1116,7 @@ function Show3D() {
     dataMin, dataMax, cmap, imageVminPct, imageVmaxPct,
     zoom, panX, panY, playbackPath,
     profileActive, profilePoints, profileWidth,
+    traitVmin, traitVmax,
   });
   React.useEffect(() => {
     playRef.current = {
@@ -1099,13 +1126,15 @@ function Show3D() {
       dataMin, dataMax, cmap, imageVminPct, imageVmaxPct,
       zoom, panX, panY, playbackPath,
       profileActive, profilePoints, profileWidth,
+      traitVmin, traitVmax,
     };
   }, [fps, reverse, boomerang, loop, loopStart, effectiveLoopEnd,
     nSlices, width, height, displayScale, canvasW, canvasH,
     logScale, autoContrast, percentileLow, percentileHigh,
     dataMin, dataMax, cmap, imageVminPct, imageVmaxPct,
     zoom, panX, panY, playbackPath,
-    profileActive, profilePoints, profileWidth]);
+    profileActive, profilePoints, profileWidth,
+    traitVmin, traitVmax]);
 
   // Playback logic — rAF-driven, zero React re-renders in hot path
   React.useEffect(() => {
@@ -1225,7 +1254,12 @@ function Show3D() {
           }
         } else {
           // Global range + slider — fused single-pass render (fastest path)
-          if (c.logScale) {
+          const hasAbsR = c.traitVmin != null && c.traitVmax != null;
+          if (hasAbsR) {
+            const rMin = c.logScale ? Math.log1p(Math.max(c.traitVmin!, 0)) : c.traitVmin!;
+            const rMax = c.logScale ? Math.log1p(Math.max(c.traitVmax!, 0)) : c.traitVmax!;
+            ({ vmin, vmax } = sliderRange(rMin, rMax, c.imageVminPct, c.imageVmaxPct));
+          } else if (c.logScale) {
             const logMin = Math.log1p(Math.max(0, c.dataMin));
             const logMax = Math.log1p(Math.max(0, c.dataMax));
             ({ vmin, vmax } = sliderRange(logMin, logMax, c.imageVminPct, c.imageVmaxPct));
@@ -1317,7 +1351,14 @@ function Show3D() {
 
     // Compute vmin/vmax
     let vmin: number, vmax: number;
-    if (autoContrast) {
+    const hasAbsoluteRange = traitVmin != null && traitVmax != null;
+    if (hasAbsoluteRange) {
+      vmin = logScale ? Math.log1p(Math.max(traitVmin!, 0)) : traitVmin!;
+      vmax = logScale ? Math.log1p(Math.max(traitVmax!, 0)) : traitVmax!;
+      if (imageVminPct > 0 || imageVmaxPct < 100) {
+        ({ vmin, vmax } = sliderRange(vmin, vmax, imageVminPct, imageVmaxPct));
+      }
+    } else if (autoContrast) {
       ({ vmin, vmax } = percentileClip(processed, percentileLow, percentileHigh));
     } else {
       const { min: pMin, max: pMax } = findDataRange(processed);
@@ -1325,21 +1366,65 @@ function Show3D() {
     }
 
     const lut = COLORMAPS[cmap] || COLORMAPS.inferno;
-    renderToOffscreenReuse(processed, lut, vmin, vmax, mainOffscreenRef.current, mainImgDataRef.current);
 
-    // Draw to main canvas
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.imageSmoothingEnabled = false;
-    ctx.clearRect(0, 0, canvasW, canvasH);
-    ctx.save();
-    ctx.translate(panX, panY);
-    ctx.scale(zoom, zoom);
-    ctx.drawImage(mainOffscreenRef.current, 0, 0, width * displayScale, height * displayScale);
-    ctx.restore();
-  }, [frameBytes, width, height, cmap, displayScale, canvasW, canvasH, imageVminPct, imageVmaxPct, logScale, autoContrast, percentileLow, percentileHigh]);
+    // GPU colormap path (single frame) — zero-copy via OffscreenCanvas→ImageBitmap
+    const engine = gpuCmapRef.current;
+    if (engine && gpuCmapReadyRef.current) {
+      engine.uploadData(0, logScale ? processed : frameData, width, height);
+      engine.uploadLUT(cmap, lut);
+      const capturedVmin = vmin, capturedVmax = vmax;
+      requestAnimationFrame(async () => {
+        if (!mainOffscreenRef.current) return;
+        // Zero-copy: GPU → OffscreenCanvas → ImageBitmap → drawImage
+        const bitmaps = engine.renderSlotsToImageBitmap([0], [{ vmin: capturedVmin, vmax: capturedVmax }], false);
+        if (bitmaps && bitmaps[0]) {
+          const ctx = mainOffscreenRef.current.getContext("2d");
+          if (ctx) ctx.drawImage(bitmaps[0], 0, 0);
+        } else {
+          // Fallback: mapAsync path
+          if (mainImgDataRef.current) {
+            const rendered = await engine.renderSlots(
+              [0], [{ vmin: capturedVmin, vmax: capturedVmax }],
+              [mainOffscreenRef.current], [mainImgDataRef.current], false,
+            );
+            if (rendered === 0) {
+              renderToOffscreenReuse(processed, lut, capturedVmin, capturedVmax, mainOffscreenRef.current!, mainImgDataRef.current!);
+            }
+          }
+        }
+        // Redraw main canvas
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.imageSmoothingEnabled = false;
+        ctx.clearRect(0, 0, canvasW, canvasH);
+        ctx.save();
+        ctx.translate(panX, panY);
+        ctx.scale(zoom, zoom);
+        ctx.drawImage(mainOffscreenRef.current!, 0, 0, width * displayScale, height * displayScale);
+        ctx.restore();
+      });
+    } else {
+      // CPU fallback
+      renderToOffscreenReuse(processed, lut, vmin, vmax, mainOffscreenRef.current, mainImgDataRef.current);
+    }
+
+    // Draw to main canvas (CPU path only — GPU path draws in its own rAF above)
+    if (!engine || !gpuCmapReadyRef.current) {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.imageSmoothingEnabled = false;
+      ctx.clearRect(0, 0, canvasW, canvasH);
+      ctx.save();
+      ctx.translate(panX, panY);
+      ctx.scale(zoom, zoom);
+      ctx.drawImage(mainOffscreenRef.current, 0, 0, width * displayScale, height * displayScale);
+      ctx.restore();
+    }
+  }, [frameBytes, width, height, cmap, displayScale, canvasW, canvasH, imageVminPct, imageVmaxPct, logScale, autoContrast, percentileLow, percentileHigh, traitVmin, traitVmax]);
 
   // Draw effect: only zoom/pan changes — cheap, just drawImage from cached offscreen
   // useLayoutEffect prevents black flash when canvas dimensions change (resize)
@@ -2259,10 +2344,14 @@ function Show3D() {
       ...selectedRoi,
       row: Math.max(0, Math.min(height - 1, Math.round(selectedRoi.row + 3))),
       col: Math.max(0, Math.min(width - 1, Math.round(selectedRoi.col + 3))),
+      shape: selectedRoi.shape,
+      radius: selectedRoi.radius,
+      radius_inner: selectedRoi.radius_inner,
+      width: selectedRoi.width,
+      height: selectedRoi.height,
       color: ROI_COLORS[roiItems.length % ROI_COLORS.length],
-      locked: false,
+      line_width: selectedRoi.line_width,
       highlight: false,
-      visible: true,
     };
     const next = [...roiItems, duplicated];
     setRoiList(next);
@@ -2330,7 +2419,14 @@ function Show3D() {
     const lut = COLORMAPS[cmap] || COLORMAPS.inferno;
 
     let vmin: number, vmax: number;
-    if (autoContrast) {
+    const hasAbsRange = traitVmin != null && traitVmax != null;
+    if (hasAbsRange) {
+      vmin = logScale ? Math.log1p(Math.max(traitVmin!, 0)) : traitVmin!;
+      vmax = logScale ? Math.log1p(Math.max(traitVmax!, 0)) : traitVmax!;
+      if (imageVminPct > 0 || imageVmaxPct < 100) {
+        ({ vmin, vmax } = sliderRange(vmin, vmax, imageVminPct, imageVmaxPct));
+      }
+    } else if (autoContrast) {
       ({ vmin, vmax } = percentileClip(processed, percentileLow, percentileHigh));
     } else {
       const { min: pMin, max: pMax } = findDataRange(processed);

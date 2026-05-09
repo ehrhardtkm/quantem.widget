@@ -19,6 +19,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from quantem.widget.browse import Browse
     from quantem.widget.edit2d import Edit2D
     from quantem.widget.io import IO, IOResult
+    from quantem.widget.live import Live
     from quantem.widget.mark2d import Mark2D
     from quantem.widget.profile import profile
     from quantem.widget.show1d import Show1D
@@ -29,6 +30,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from quantem.widget.show4dstem import Show4DSTEM
     from quantem.widget.show_metric_explorer import MetricExplorer
     from quantem.widget.showcomplex import ShowComplex2D
+    from quantem.widget.showdiffraction import ShowDiffraction
     from quantem.widget.showpdf import ShowPDF
 
 
@@ -43,6 +45,7 @@ _EXPORTS = {
     "Edit2D": ("quantem.widget.edit2d", "Edit2D"),
     "IO": ("quantem.widget.io", "IO"),
     "IOResult": ("quantem.widget.io", "IOResult"),
+    "Live": ("quantem.widget.live", "Live"),
     "Mark2D": ("quantem.widget.mark2d", "Mark2D"),
     "Show1D": ("quantem.widget.show1d", "Show1D"),
     "Show2D": ("quantem.widget.show2d", "Show2D"),
@@ -52,8 +55,11 @@ _EXPORTS = {
     "Show4DSTEM": ("quantem.widget.show4dstem", "Show4DSTEM"),
     "MetricExplorer": ("quantem.widget.show_metric_explorer", "MetricExplorer"),
     "ShowComplex2D": ("quantem.widget.showcomplex", "ShowComplex2D"),
+    "ShowDiffraction": ("quantem.widget.showdiffraction", "ShowDiffraction"),
     "ShowPDF": ("quantem.widget.showpdf", "ShowPDF"),
     "profile": ("quantem.widget.profile", "profile"),
+    "enable_hmr": ("quantem.widget._hmr", "enable_hmr"),
+    "disable_hmr": ("quantem.widget._hmr", "disable_hmr"),
 }
 
 
@@ -81,6 +87,7 @@ __all__ = [
     "Edit2D",
     "IO",
     "IOResult",
+    "Live",
     "Mark2D",
     "profile",
     "Show1D",
@@ -91,5 +98,8 @@ __all__ = [
     "Show4DSTEM",
     "MetricExplorer",
     "ShowComplex2D",
+    "ShowDiffraction",
     "ShowPDF",
+    "enable_hmr",
+    "disable_hmr",
 ]

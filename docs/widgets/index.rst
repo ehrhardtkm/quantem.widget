@@ -27,6 +27,7 @@ Workflow widgets:
    show4d
    show4dstem
    showcomplex
+   showpdf
    mark2d
    edit2d
    align2d

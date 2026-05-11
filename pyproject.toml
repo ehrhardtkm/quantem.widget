@@ -76,6 +76,7 @@ ensured-targets = [
     "src/quantem/widget/static/showcomplex.js",
     "src/quantem/widget/static/browse.js",
     "src/quantem/widget/static/showdiffraction.js",
+    "src/quantem/widget/static/showpdf.js",
 ]
 skip-if-exists = ["src/quantem/widget/static/show2d.js"]
 dependencies = ["hatch-jupyter-builder>=0.5.0"]

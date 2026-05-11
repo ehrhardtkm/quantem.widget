@@ -29,7 +29,7 @@ def smoke_page(browser_context):
             "import pathlib\n",
             "from quantem.widget import Bin, Bin2D, Browse, Mark2D, Show1D, Show2D, Show3D, Show3DVolume, Show4DSTEM\n",
             "from quantem.widget import Show4D, Edit2D, Align2D, ShowComplex2D\n",
-            "from quantem.widget import MetricExplorer\n",
+            "from quantem.widget import MetricExplorer, ShowPDF\n",
         ]},
         {"source": [
             "Show1D(np.random.rand(256).astype(np.float32), title='Show1D Smoke')\n",
@@ -69,6 +69,9 @@ def smoke_page(browser_context):
         ]},
         {"source": [
             "ShowComplex2D(np.random.rand(64, 64).astype(np.float32) + 1j * np.random.rand(64, 64).astype(np.float32))\n",
+        ]},
+        {"source": [
+            "ShowPDF(np.random.rand(8, 8, 32, 32).astype(np.float32), title='ShowPDF Smoke', find_origin=False, origin_row=16, origin_col=16, device='cpu')\n",
         ]},
         {"source": [
             "_me_points = [\n",
@@ -111,6 +114,7 @@ ALL_WIDGETS = [
     "edit2d-root",
     "align2d-root",
     "showcomplex-root",
+    "showpdf-root",
     "show-metric-explorer-root",
     "browse-root",
 ]

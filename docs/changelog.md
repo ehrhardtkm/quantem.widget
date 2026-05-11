@@ -2,6 +2,9 @@
 
 ## v0.0.16 (unreleased)
 
+### New widgets
+- **ShowPDF** — interactive pair distribution function analysis for 4D-STEM data: mask vs. probe analysis modes, live I(k) + B(k) background fit, F(k) Lorch-windowed transform, G(r) reduced PDF, and g(r) density-corrected curves; real-time tunable k-fit/k-window/k-lowpass/k-highpass/r-cut/damping parameters with instant re-computation; auto-extracts scan calibration from `Dataset4dstem`; accepts NumPy/PyTorch/CuPy arrays directly; `save_image(path, plot_mode=...)` exports any curve as PNG/PDF/TIFF; state persistence and tool lock/hide
+
 ### Show2D (drift comparison + framing)
 - **`smooth=True`** toggle — bilinear vs pixelated. Wires `ctx.imageSmoothingEnabled` (CSS `image-rendering` alone is a no-op when canvas buffer == display size).
 - **MAX_ZOOM 10× → 20×** for tighter inspection.

@@ -100,6 +100,14 @@ WIDGET_CELLS: list[tuple[str, list[str]]] = [
     ("ShowComplex2D HSV", [
         "ShowComplex2D(complex_data, title='ShowComplex2D HSV', display_mode='hsv')\n",
     ]),
+    # ── ShowPDF ───────────────────────────────────────────────────────────
+    ("ShowPDF Default", [
+        "from quantem.widget import ShowPDF\n",
+        "ShowPDF(data_4d, title='ShowPDF Default', pixel_size=2.39, find_origin=False, origin_row=32, origin_col=32, device='cpu')\n",
+    ]),
+    ("ShowPDF Probe Mode", [
+        "ShowPDF(data_4d, title='ShowPDF Probe Mode', analysis_mode='probe', probe_row=8, probe_col=8, find_origin=False, origin_row=32, origin_col=32, device='cpu')\n",
+    ]),
     # ── Mark2D ────────────────────────────────────────────────────────────
     ("Mark2D Default", [
         "from quantem.widget import Mark2D\n",
@@ -162,6 +170,7 @@ WIDGET_CSS_CLASS = {
     "Show4DSTEM": ".show4dstem-root",
     "Show4D": ".show4d-root",
     "ShowComplex2D": ".showcomplex-root",
+    "ShowPDF": ".showpdf-root",
     "Mark2D": ".mark2d-root",
     "Edit2D": ".edit2d-root",
     "Align2D": ".align2d-root",

@@ -8,6 +8,7 @@ import anywidget
 import numpy as np
 import traitlets
 
+from quantem.core.datastructures import Dataset2d, Dataset4dstem
 from quantem.diffraction import PairDistributionFunction
 from quantem.widget.array_utils import to_numpy
 from quantem.widget.detector import virtual_images
@@ -151,7 +152,7 @@ class ShowPDF(anywidget.AnyWidget):
         data,
         *,
         nav_image=None,
-        title="PDF",
+        title="",
         # PDF parameters
         k_min_fit=0.0,
         k_max_fit=0.0,
@@ -215,6 +216,19 @@ class ShowPDF(anywidget.AnyWidget):
                 data = data.data
             if hasattr(data, "array") and hasattr(data, "name"):
                 _extracted_title = _extracted_title or (data.name or "")
+
+            # Wrap raw NumPy/Torch/CuPy arrays in a Dataset so PairDistributionFunction
+            # can consume them. Datasets (which carry .array) pass through unchanged.
+            if not hasattr(data, "array"):
+                arr = to_numpy(data)
+                if arr.ndim == 4:
+                    data = Dataset4dstem.from_array(arr)
+                elif arr.ndim == 2:
+                    data = Dataset2d.from_array(arr)
+                else:
+                    raise ValueError(
+                        f"ShowPDF expects 4D (4D-STEM) or 2D input; got {arr.ndim}D array."
+                    )
 
             # Resolve device. PairDistributionFunction uses float64 tensors
             # internally, which MPS does not support and which AMD/embedded
@@ -650,8 +664,16 @@ class ShowPDF(anywidget.AnyWidget):
         else:
             if hasattr(data, "data") and hasattr(data, "title"):
                 data = data.data
-            if hasattr(data, "array") and hasattr(data, "name"):
-                pass  # PairDistributionFunction.from_data handles Dataset duck typing
+            if not hasattr(data, "array"):
+                arr = to_numpy(data)
+                if arr.ndim == 4:
+                    data = Dataset4dstem.from_array(arr)
+                elif arr.ndim == 2:
+                    data = Dataset2d.from_array(arr)
+                else:
+                    raise ValueError(
+                        f"ShowPDF expects 4D (4D-STEM) or 2D input; got {arr.ndim}D array."
+                    )
             self._pdf = PairDistributionFunction.from_data(
                 data, find_origin=find_origin, **pdf_kwargs
             )
@@ -682,6 +704,99 @@ class ShowPDF(anywidget.AnyWidget):
         self._pdf.bg = None
         self._recompute_full()
         return self
+
+    def save_image(
+        self,
+        path: str | pathlib.Path,
+        *,
+        plot_mode: str | None = None,
+        format: str | None = None,
+        dpi: int = 150,
+    ) -> pathlib.Path:
+        """Save the current PDF curve as PNG, PDF, or TIFF.
+
+        Parameters
+        ----------
+        path : str or pathlib.Path
+            Output file path.
+        plot_mode : {"Ik", "Fk", "Gr", "gr"}, optional
+            Curve to render. Defaults to the widget's current ``plot_mode``.
+        format : {"png", "pdf", "tiff"}, optional
+            Inferred from the file extension when omitted.
+        dpi : int, default 150
+            Output resolution.
+
+        Returns
+        -------
+        pathlib.Path
+            The written file path.
+        """
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        path = pathlib.Path(path)
+        fmt = (format or path.suffix.lstrip(".").lower() or "png").lower()
+        if fmt in ("tif",):
+            fmt = "tiff"
+        if fmt not in ("png", "pdf", "tiff"):
+            raise ValueError(f"Unsupported format: {fmt!r}. Use 'png', 'pdf', or 'tiff'.")
+
+        mode = plot_mode if plot_mode is not None else self.plot_mode
+        if mode not in ("Ik", "Fk", "Gr", "gr"):
+            raise ValueError(f"Unknown plot_mode: {mode!r}. Use 'Ik', 'Fk', 'Gr', or 'gr'.")
+
+        bg = None
+        if mode == "Ik":
+            if self._pdf.Ik is None:
+                raise ValueError("I(k) is not computed yet — set a mask or call _recompute_full().")
+            x = np.asarray(self._pdf.qq, dtype=np.float32)
+            y = to_numpy(self._pdf.Ik).astype(np.float32)
+            if self._pdf.bg is not None and self.show_background:
+                bg = to_numpy(self._pdf.bg).astype(np.float32)
+            xlabel, ylabel = "k (1/Å)", "I(k)"
+        elif mode == "Fk":
+            if self._pdf.Fk_masked is None:
+                raise ValueError("F(k) is not computed yet.")
+            qq = np.asarray(self._pdf.qq, dtype=np.float32)
+            fk = to_numpy(self._pdf.Fk_masked).astype(np.float32)
+            x = qq[: len(fk)]
+            y = fk
+            xlabel, ylabel = "k (1/Å)", "F(k)"
+        elif mode == "Gr":
+            if self._pdf._r is None or self._pdf._reduced_pdf is None:
+                raise ValueError("G(r) is not computed yet.")
+            Gr = (
+                self._pdf.reduced_pdf_damped
+                if self._pdf.reduced_pdf_damped is not None
+                else self._pdf._reduced_pdf
+            )
+            x = to_numpy(self._pdf._r).astype(np.float32)
+            y = to_numpy(Gr).astype(np.float32)
+            xlabel, ylabel = "r (Å)", "G(r)"
+        else:  # "gr"
+            if not self.pdf_x_bytes or not self.pdf_y_bytes:
+                raise ValueError("g(r) is not computed yet.")
+            x = np.frombuffer(self.pdf_x_bytes, dtype=np.float32)
+            y = np.frombuffer(self.pdf_y_bytes, dtype=np.float32)
+            xlabel, ylabel = "r (Å)", "g(r)"
+
+        fig, ax = plt.subplots(figsize=(6, 3.5), dpi=dpi)
+        ax.plot(x, y, color="steelblue", linewidth=1.0, label=ylabel)
+        if bg is not None:
+            ax.plot(x, bg, color="orange", linewidth=1.0, linestyle="--", label="B(k)")
+            ax.legend(fontsize=8, framealpha=0.8)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        if self.title:
+            ax.set_title(self.title, fontsize=11)
+        ax.grid(True, alpha=0.3, linestyle="--")
+        fig.tight_layout()
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(str(path), format=fmt, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+        return path
 
     # =========================================================================
     # State persistence

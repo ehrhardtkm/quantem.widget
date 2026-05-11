@@ -809,7 +809,7 @@ function ShowPDFWidget() {
   // JSX
   // =========================================================================
   return (
-    <Box tabIndex={0} onKeyDown={handleKeyDown} sx={{ fontFamily: FONT, outline: "none", p: 1 }}>
+    <Box className="showpdf-root" tabIndex={0} onKeyDown={handleKeyDown} sx={{ fontFamily: FONT, outline: "none", p: 1, bgcolor: colors.bg, color: colors.text }}>
       <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: `${SPACING.SM}px` }}>
         <Typography sx={typo.title}>{title || "PDF"}</Typography>
         <Stack direction="row" alignItems="center" gap={1}>

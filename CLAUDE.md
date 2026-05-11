@@ -21,6 +21,7 @@ quantem.widget — Interactive Jupyter widgets for electron microscopy (anywidge
 - **Show4D** — General 4D dataset explorer (nav + signal panels), ROI masking, path animation
 - **Show4DSTEM** — 4D-STEM diffraction pattern viewer with virtual imaging, ROI presets, 5D time/tilt series support
 - **ShowComplex2D** — Complex-valued 2D viewer (amplitude/phase/HSV/real/imag), phase colorwheel
+- **ShowPDF** — Pair distribution function analysis for 4D-STEM with interactive mask/probe selection, k-range/window/damping controls, and live I(k)/F(k)/G(r)/g(r) curves
 - **Mark2D** — Interactive 2D image annotation (points, ROIs, profiles, snap-to-peak, undo)
 - **Edit2D** — Interactive crop/pad/mask editor with brush tool
 - **Align2D** — Image alignment overlay with FFT-based auto-align, opacity blending

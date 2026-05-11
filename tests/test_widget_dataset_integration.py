@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4d, Dataset4dstem
-from quantem.widget import Align2D, Edit2D, Mark2D, Show2D, Show3D, Show3DVolume, Show4D, Show4DSTEM, ShowComplex2D, ShowDiffraction
+from quantem.widget import Align2D, Edit2D, Mark2D, Show2D, Show3D, Show3DVolume, Show4D, Show4DSTEM, ShowComplex2D, ShowDiffraction, ShowPDF
 
 # =========================================================================
 # Show2D + Dataset2d
@@ -446,3 +446,69 @@ def test_showdiffraction_dataset4dstem_explicit_overrides():
     w = ShowDiffraction(ds, pixel_size=5.0, k_pixel_size=0.1, verbose=False)
     assert w.pixel_size == pytest.approx(5.0)
     assert w.k_pixel_size == pytest.approx(0.1)
+
+
+# =========================================================================
+# ShowPDF + Dataset4dstem
+# =========================================================================
+
+def _make_showpdf(ds, **kwargs):
+    """Construct ShowPDF with small/fast PDF compute settings."""
+    return ShowPDF(
+        ds,
+        find_origin=False,
+        origin_row=8,
+        origin_col=8,
+        num_annular_bins=36,
+        radial_step=1.0,
+        device="cpu",
+        **kwargs,
+    )
+
+
+def test_showpdf_dataset4dstem_extracts_title():
+    ds = Dataset4dstem.from_array(
+        array=np.random.rand(4, 4, 16, 16).astype(np.float32),
+        name="Amorphous Ta",
+        sampling=(2.39, 2.39, 0.46, 0.46),
+        units=("Å", "Å", "mrad", "mrad"),
+    )
+    w = _make_showpdf(ds)
+    assert w.title == "Amorphous Ta"
+
+
+def test_showpdf_dataset4dstem_extracts_calibration():
+    ds = Dataset4dstem.from_array(
+        array=np.random.rand(4, 4, 16, 16).astype(np.float32),
+        name="test",
+        sampling=(2.39, 2.39, 0.46, 0.46),
+        units=("Å", "Å", "mrad", "mrad"),
+    )
+    w = _make_showpdf(ds)
+    assert w.nav_pixel_size == pytest.approx(2.39)
+    assert w.nav_unit == "Å"
+
+
+def test_showpdf_dataset4dstem_nm_to_angstrom():
+    ds = Dataset4dstem.from_array(
+        array=np.random.rand(4, 4, 16, 16).astype(np.float32),
+        name="test",
+        sampling=(0.239, 0.239, 0.46, 0.46),
+        units=("nm", "nm", "mrad", "mrad"),
+    )
+    w = _make_showpdf(ds)
+    assert w.nav_pixel_size == pytest.approx(2.39)  # 0.239 nm = 2.39 Å
+    assert w.nav_unit == "Å"
+
+
+def test_showpdf_dataset4dstem_explicit_overrides():
+    ds = Dataset4dstem.from_array(
+        array=np.random.rand(4, 4, 16, 16).astype(np.float32),
+        name="test",
+        sampling=(2.39, 2.39, 0.46, 0.46),
+        units=("Å", "Å", "mrad", "mrad"),
+    )
+    w = _make_showpdf(ds, title="Override", pixel_size=5.0)
+    assert w.title == "Override"
+    assert w.nav_pixel_size == pytest.approx(5.0)
+    assert w.nav_unit == "Å"

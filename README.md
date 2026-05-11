@@ -109,6 +109,20 @@ w.save_image("virtual.pdf", view="virtual", frame_idx=3)
 w.save_image("all_panels.png", view="all")
 ```
 
+### ShowPDF - 4D-STEM Pair Distribution Function
+
+```python
+import numpy as np
+from quantem.widget import ShowPDF
+
+data = np.random.rand(64, 64, 128, 128).astype(np.float32)  # 4D-STEM scan
+w = ShowPDF(data, pixel_size=2.39, k_min_fit=0.5, r_max=20.0)
+w  # interactive mask/probe selection with live I(k), F(k), G(r), g(r) curves
+
+# export the current PDF curve
+w.save_image("Gr.pdf", plot_mode="Gr")
+```
+
 ### Bin2D - Interactive 2D Image Binning
 
 ```python
@@ -193,6 +207,7 @@ All widgets accept NumPy arrays, PyTorch tensors, CuPy arrays, and quantem Datas
 | Show4D | yes | yes | yes | `Dataset4dstem` |
 | Show4DSTEM | yes | yes | yes | `Dataset4dstem` |
 | ShowComplex2D | yes | yes | yes | duck typing |
+| ShowPDF | yes | yes | yes | `Dataset4dstem` |
 | Mark2D | yes | yes | yes | `Dataset2d` |
 | Edit2D | yes | yes | yes | `Dataset2d` |
 | Align2D | yes | yes | yes | `Dataset2d` |

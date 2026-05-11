@@ -21,6 +21,7 @@ Each widget has two notebooks: a **simple** quickstart and a comprehensive **all
 | Show4DSTEM | [simple](show4dstem/show4dstem_simple) | [all features](show4dstem/show4dstem_all_features) |
 | Show5DSTEM | [simple](show5dstem/show5dstem_simple) | [all features](show5dstem/show5dstem_all_features) |
 | ShowComplex2D | [simple](showcomplex2d/showcomplex2d_simple) | [all features](showcomplex2d/showcomplex2d_all_features) |
+| ShowPDF | [simple](showpdf/showpdf_simple) | [all features](showpdf/showpdf_all_features) |
 | Mark2D | [simple](mark2d/mark2d_simple) | [all features](mark2d/mark2d_all_features) |
 | Edit2D | [simple](edit2d/edit2d_simple) | [all features](edit2d/edit2d_all_features) |
 | Align2D | [simple](align2d/align2d_simple) | [all features](align2d/align2d_all_features) |
@@ -48,6 +49,8 @@ show5dstem/show5dstem_simple
 show5dstem/show5dstem_all_features
 showcomplex2d/showcomplex2d_simple
 showcomplex2d/showcomplex2d_all_features
+showpdf/showpdf_simple
+showpdf/showpdf_all_features
 mark2d/mark2d_simple
 mark2d/mark2d_all_features
 edit2d/edit2d_simple

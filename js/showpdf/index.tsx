@@ -373,10 +373,10 @@ function ShowPDFWidget() {
     const mimg = mctx.createImageData(scanCols, scanRows);
     for (let i = 0; i < mask.length; i++) {
       if (mask[i] === 0) {
-        mimg.data[i * 4] = 0;
+        mimg.data[i * 4] = 255;
         mimg.data[i * 4 + 1] = 0;
         mimg.data[i * 4 + 2] = 0;
-        mimg.data[i * 4 + 3] = 140;
+        mimg.data[i * 4 + 3] = 110;
       }
     }
     mctx.putImageData(mimg, 0, 0);
@@ -443,9 +443,8 @@ function ShowPDFWidget() {
     const xR = findDataRange(xArr);
     const useLog = plotMode === "Ik" && ikLogScale;
     const yR = findDataRange(yArr);
-    const xPad = (xR.max - xR.min) * 0.02 || 0.1;
-    setPlotXMin(xR.min - xPad);
-    setPlotXMax(xR.max + xPad);
+    setPlotXMin(xR.min);
+    setPlotXMax(xR.max);
     if (useLog) {
       const logMin = yR.min > 0 ? Math.log10(yR.min) : 0;
       const logMax = yR.max > 0 ? Math.log10(yR.max) : 1;
@@ -537,11 +536,35 @@ function ShowPDFWidget() {
       }
       ctx.stroke(); ctx.setLineDash([]);
     };
+    const drawKRange = (k0: number, k1: number, color: string, label0: string, label1: string) => {
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2.5;
+      ctx.setLineDash([14, 6]);
+      ctx.fillStyle = color;
+      ctx.font = `11px ${MONO}`;
+      ctx.textBaseline = "top";
+      for (const [kv, lbl, align] of [[k0, label0, "left"], [k1, label1, "right"]] as const) {
+        if (!isFinite(kv)) continue;
+        const cx = snap(d2cx(kv));
+        if (cx < mL || cx > mL + pw) continue;
+        ctx.beginPath();
+        ctx.moveTo(cx, mT);
+        ctx.lineTo(cx, mT + ph);
+        ctx.stroke();
+        ctx.textAlign = align;
+        const tx = align === "left" ? cx + 3 : cx - 3;
+        ctx.fillText(lbl, tx, mT + 2);
+      }
+      ctx.restore();
+    };
     if (plotMode === "Ik") {
       drawLine(ikXRef.current, ikYRef.current, TRACE_COLORS.ik);
       if (showBackground) drawLine(ikXRef.current, ikBgRef.current, TRACE_COLORS.bg, true);
+      drawKRange(kMinFit, kMaxFit, "#ffb300", "k fit", "");
     } else if (plotMode === "Fk") {
       drawLine(fkXRef.current, fkYRef.current, TRACE_COLORS.fk);
+      drawKRange(kMinWindow, kMaxWindow, "#ffb300", "k window", "");
     } else if (plotMode === "gr") {
       ctx.strokeStyle = isDark ? "rgba(255,255,255,0.2)" : "rgba(0,0,0,0.2)";
       ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
@@ -581,7 +604,8 @@ function ShowPDFWidget() {
       ctx.fillRect(mL, mT, pw, ph);
     }
   }, [PLOT_W, PLOT_H, plotXMin, plotXMax, plotYMin, plotYMax, plotMode, showBackground, ikLogScale, cursorData, computing, isDark,
-      ikXBytes, ikYBytes, ikBgYBytes, fkXBytes, fkYBytes, grXBytes, grYBytes, pdfXBytes, pdfYBytes]);
+      ikXBytes, ikYBytes, ikBgYBytes, fkXBytes, fkYBytes, grXBytes, grYBytes, pdfXBytes, pdfYBytes,
+      kMinFit, kMaxFit, kMinWindow, kMaxWindow]);
 
   // =========================================================================
   // Nav mouse handlers
@@ -809,7 +833,7 @@ function ShowPDFWidget() {
   // JSX
   // =========================================================================
   return (
-    <Box className="showpdf-root" tabIndex={0} onKeyDown={handleKeyDown} sx={{ fontFamily: FONT, outline: "none", p: 1, bgcolor: colors.bg, color: colors.text }}>
+    <Box className="showpdf-root" tabIndex={0} onKeyDown={handleKeyDown} sx={{ fontFamily: FONT, outline: "none", border: "none", p: 1, bgcolor: colors.bg, color: colors.text, "&:focus": { outline: "none" }, "&:focus-visible": { outline: "none" } }}>
       <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: `${SPACING.SM}px` }}>
         <Typography sx={typo.title}>{title || "PDF"}</Typography>
         <Stack direction="row" alignItems="center" gap={1}>
@@ -893,7 +917,33 @@ function ShowPDFWidget() {
               )}
               <Stack direction="row" alignItems="center" gap={1}>
                 <Typography sx={typo.labelSmall}>Cmap:</Typography>
-                <Select value={cmap} onChange={(e) => setCmap(e.target.value)} size="small" sx={{ fontSize: 12, height: 28, minWidth: 80 }}>
+                <Select
+                  value={cmap}
+                  onChange={(e) => setCmap(e.target.value)}
+                  size="small"
+                  sx={{
+                    fontSize: 12,
+                    height: 28,
+                    minWidth: 80,
+                    color: colors.text,
+                    bgcolor: colors.controlBg,
+                    "& .MuiSvgIcon-root": { color: colors.text },
+                    "& .MuiOutlinedInput-notchedOutline": { borderColor: colors.border },
+                    "&:hover .MuiOutlinedInput-notchedOutline": { borderColor: colors.accent },
+                  }}
+                  MenuProps={{
+                    PaperProps: {
+                      sx: {
+                        bgcolor: colors.controlBg,
+                        color: colors.text,
+                        border: `1px solid ${colors.border}`,
+                        "& .MuiMenuItem-root": { color: colors.text },
+                        "& .MuiMenuItem-root:hover": { bgcolor: colors.bg },
+                        "& .MuiMenuItem-root.Mui-selected": { bgcolor: colors.bg },
+                      },
+                    },
+                  }}
+                >
                   {CMAP_OPTIONS.map((name) => <MenuItem key={name} value={name} sx={{ fontSize: 12 }}>{name}</MenuItem>)}
                 </Select>
               </Stack>

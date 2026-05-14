@@ -29,6 +29,7 @@ class ShowPDF(anywidget.AnyWidget):
     """
 
     _esm = pathlib.Path(__file__).parent / "static" / "showpdf.js"
+    _css = pathlib.Path(__file__).parent / "static" / "showpdf.css"
 
     # =========================================================================
     # Version
